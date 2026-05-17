@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dinov3-windows-frontend"
+version = "0.1.0"
+description = "Windows Qt frontend for WSL-hosted Dinov3_postprocess runtime"
+requires-python = ">=3.10,<3.12"
+dependencies = ["PyQt5>=5.15"]
+
+[project.scripts]
+dinov3-windows-frontend = "dinov3_windows_frontend.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
