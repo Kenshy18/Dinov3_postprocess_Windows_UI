@@ -21,11 +21,20 @@ checkpoint usage, and runtime-profile selection on the WSL side.
 From this Windows-side repository:
 
 ```powershell
-py -3.11 -m venv .venv
+.\scripts\run_dev.ps1
+```
+
+Manual setup, if needed:
+
+```powershell
+py -3.10 -m venv .venv
 .\.venv\Scripts\python -m pip install -U pip
 .\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m dinov3_windows_frontend
 ```
+
+Python 3.10 or 3.11 is recommended. The helper scripts try `py -3.11`,
+`py -3.10`, `python`, and `python3` in that order.
 
 On first launch, fill in:
 
@@ -33,9 +42,11 @@ On first launch, fill in:
 - WSL runtime repo path, for example `/home/kenke/Dinov3_postprocess`
 - Windows output directory
 
-Use **接続確認** before running jobs. The check validates `wsl.exe`, the WSL
-repository, `.runtime/gui_runtime.env`, runtime artifacts, and the WSL Python
-configured by setup.
+The app also tries to discover `Dinov3_postprocess` under the installed WSL
+distros on startup. Use **自動探索** to rerun discovery manually, then use
+**接続確認** before running jobs. The connection check validates `wsl.exe`, the
+WSL repository, `.runtime/gui_runtime.env`, runtime profile, WSL-side UI job
+scripts, runtime Python imports, runtime artifacts, and TensorRT artifacts.
 
 ## Build EXE
 
@@ -44,6 +55,31 @@ configured by setup.
 ```
 
 The executable is written under `dist\Dinov3PostprocessFrontend`.
+
+## Generate Codec/Meta Debug Inputs
+
+Use this when you want to stress the Windows frontend and WSL backend with
+the same source content but different containers, codecs, and video metadata.
+The script writes generated files to `input_meta_debug` and keeps the original
+`input` folder untouched.
+
+Preview the plan only:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\generate_input_meta_variants.ps1 -AllVideos -ShortTricky
+```
+
+Generate the files:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\generate_input_meta_variants.ps1 -AllVideos -ShortTricky -Run -Verify
+```
+
+`-AllVideos` creates long batch variants for every input video: H.265 MP4,
+MPEG-4 AVI, H.264 MKV, and interlaced-flagged H.264 MP4. `-ShortTricky`
+creates heavier edge-case variants only from the shortest source: VFR MKV,
+rotation metadata MP4, non-square SAR MP4, and 10-bit 4:2:2 HEVC MP4.
+`-IncludeHuge` also adds a ProRes 422 MOV variant, but it can be very large.
 
 ## Runtime Model
 
@@ -70,3 +106,15 @@ The command calls WSL-side `apps/qt_ui/run_ui_job.py`, which then calls
 `[phase-progress]` are parsed by the Windows UI and shown without changing the
 WSL inference/postprocess implementation.
 
+The Windows frontend stages each job under the WSL repository at:
+
+```text
+<wsl_repo>/.runtime/windows_frontend_staging/<run_name>/
+```
+
+After the WSL-side job completes successfully, the finished run directory is
+copied to the selected Windows output directory and the WSL staging directory is
+removed. This keeps detector and postprocess execution on the Ubuntu runtime
+while making the user-facing output a normal Windows folder. Text-based summary
+and log files are rewritten from staging paths to the final Windows path during
+the copy step.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -10,6 +10,7 @@ from pathlib import Path
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .path_utils import VIDEO_EXTS, clean_run_part, normalize_windows_path, windows_path_to_wsl, wsl_path_to_unc
+from .process_utils import hidden_windows_process_command
 from .progress import format_duration, parse_progress_line
 from .progress_view import ProgressDashboard, phase_key, phase_label, progress_float
 from .settings import AppSettings
@@ -39,8 +40,8 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.runtime: WslRuntime | None = None
 
         self.setWindowTitle("SOD推論システム - Windows Frontend")
-        self.resize(920, 780)
-        self.setMinimumSize(860, 680)
+        self.resize(960, 800)
+        self.setMinimumSize(880, 700)
 
         self.queue_paths: list[Path] = []
         self.run_queue: list[Path] = []
@@ -58,6 +59,9 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.active_progress_phase_key = ""
         self.last_overall_percent = 0.0
         self.last_built_run_name = ""
+        self.last_built_staging_output_root_wsl = ""
+        self.last_built_staging_run_dir_wsl = ""
+        self.last_built_final_run_dir_wsl = ""
 
         self.elapsed_timer = QtCore.QTimer(self)
         self.elapsed_timer.setInterval(1000)
@@ -66,6 +70,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.build_ui()
         self.apply_style()
         self.refresh_wsl_distros()
+        self.discover_runtime(silent=True)
         self.load_runtime(silent=True)
         self.update_queue_state()
         self.update_running_state(False)
@@ -74,112 +79,148 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         central.setObjectName("centralRoot")
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
         self.setCentralWidget(central)
 
         root.addWidget(self.build_connection_panel())
         root.addWidget(self.build_run_settings())
 
         body = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        body.setObjectName("bodySplitter")
         body.setChildrenCollapsible(False)
+        body.setHandleWidth(8)
         root.addWidget(body, 1)
 
         upper = QtWidgets.QWidget()
+        upper.setMinimumHeight(220)
         upper_layout = QtWidgets.QHBoxLayout(upper)
         upper_layout.setContentsMargins(0, 0, 0, 0)
-        upper_layout.setSpacing(8)
+        upper_layout.setSpacing(10)
         upper_layout.addWidget(self.build_queue_panel(), 7)
         upper_layout.addWidget(self.build_status_panel(), 11)
         body.addWidget(upper)
 
         lower = QtWidgets.QWidget()
+        lower.setMinimumHeight(200)
         lower_layout = QtWidgets.QHBoxLayout(lower)
         lower_layout.setContentsMargins(0, 0, 0, 0)
-        lower_layout.setSpacing(8)
+        lower_layout.setSpacing(10)
         lower_layout.addWidget(self.build_log_panel(), 8)
         lower_layout.addWidget(self.build_postprocess_panel(), 10)
         body.addWidget(lower)
-        body.setSizes([320, 260])
+        body.setStretchFactor(0, 5)
+        body.setStretchFactor(1, 4)
+        body.setSizes([400, 320])
 
     def build_connection_panel(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("WSL接続")
         grid = QtWidgets.QGridLayout(box)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
+        grid.setContentsMargins(12, 10, 12, 10)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
         self.wsl_combo = ClosingComboBox()
         self.wsl_combo.setEditable(True)
         self.wsl_combo.setEditText(self.settings.wsl_distro)
+        self.wsl_combo.setMinimumWidth(160)
         self.refresh_wsl_button = QtWidgets.QPushButton("WSL一覧更新")
         self.refresh_wsl_button.clicked.connect(self.refresh_wsl_distros)
+        self.discover_runtime_button = QtWidgets.QPushButton("自動探索")
+        self.discover_runtime_button.clicked.connect(lambda: self.discover_runtime(silent=False))
         self.wsl_repo_edit = QtWidgets.QLineEdit(self.settings.wsl_repo_path)
         self.test_connection_button = QtWidgets.QPushButton("接続確認")
+        self.test_connection_button.setObjectName("secondaryButton")
         self.test_connection_button.clicked.connect(lambda: self.load_runtime(silent=False))
         self.runtime_info_label = QtWidgets.QLabel("未確認")
+        self.runtime_info_label.setObjectName("runtimeInfo")
         self.runtime_info_label.setWordWrap(True)
         self.runtime_info_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        grid.addWidget(QtWidgets.QLabel("Distro"), 0, 0)
+        grid.addWidget(self._form_label("Distro"), 0, 0)
         grid.addWidget(self.wsl_combo, 0, 1)
         grid.addWidget(self.refresh_wsl_button, 0, 2)
-        grid.addWidget(QtWidgets.QLabel("WSL repo"), 1, 0)
+        grid.addWidget(self.discover_runtime_button, 0, 3)
+        grid.addWidget(self._form_label("WSL repo"), 1, 0)
         grid.addWidget(self.wsl_repo_edit, 1, 1)
-        grid.addWidget(self.test_connection_button, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("Runtime"), 2, 0)
-        grid.addWidget(self.runtime_info_label, 2, 1, 1, 2)
+        grid.addWidget(self.test_connection_button, 1, 2, 1, 2)
+        grid.addWidget(self._form_label("Runtime"), 2, 0, QtCore.Qt.AlignTop)
+        grid.addWidget(self.runtime_info_label, 2, 1, 1, 3)
         grid.setColumnStretch(1, 1)
         return box
+
+    def _form_label(self, text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("formLabel")
+        return label
 
     def build_run_settings(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("実行設定")
         root = QtWidgets.QVBoxLayout(box)
-        root.setSpacing(6)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(10)
 
-        top = QtWidgets.QGridLayout()
-        top.setHorizontalSpacing(8)
-        top.setVerticalSpacing(6)
+        form = QtWidgets.QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
         self.output_edit = QtWidgets.QLineEdit(self.settings.windows_output_dir)
-        self.output_browse_button = QtWidgets.QPushButton("参照")
+        self.output_browse_button = QtWidgets.QPushButton("参照…")
         self.output_browse_button.clicked.connect(self.browse_output_dir)
         self.detector_combo = ClosingComboBox()
         self.detector_combo.addItem("DINOv3", "dinov3")
         self.detector_combo.addItem("EVA02", "eva02")
         self.detector_combo.addItem("Co-DINO", "codino")
         self.detector_combo.setCurrentIndex(1)
+        self.detector_combo.setMinimumWidth(140)
+
+        form.addWidget(self._form_label("Backend"), 0, 0)
+        form.addWidget(self.detector_combo, 0, 1)
+        form.addWidget(self._form_label("結果保存先"), 0, 2)
+        form.addWidget(self.output_edit, 0, 3)
+        form.addWidget(self.output_browse_button, 0, 4)
+        form.setColumnStretch(3, 1)
+        root.addLayout(form)
+
+        overlay_row = QtWidgets.QHBoxLayout()
+        overlay_row.setSpacing(12)
+        overlay_label = QtWidgets.QLabel("オーバーレイ")
+        overlay_label.setObjectName("sectionLabel")
+        self.detailed_overlay_check = QtWidgets.QCheckBox("詳細")
+        self.detector_overlay_check = QtWidgets.QCheckBox("AI生成カバー")
+        self.simple_overlay_check = QtWidgets.QCheckBox("簡易")
+        self.detailed_overlay_check.setChecked(True)
+        overlay_row.addWidget(overlay_label)
+        overlay_row.addWidget(self.detailed_overlay_check)
+        overlay_row.addWidget(self.detector_overlay_check)
+        overlay_row.addWidget(self.simple_overlay_check)
+        overlay_row.addStretch(1)
+        root.addLayout(overlay_row)
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(8)
+        self.check_artifacts_button = QtWidgets.QPushButton("チェックポイント確認")
+        self.check_artifacts_button.setObjectName("secondaryButton")
+        self.check_artifacts_button.clicked.connect(self.check_artifacts)
+        self.advanced_button = QtWidgets.QToolButton()
+        self.advanced_button.setObjectName("advancedToggle")
+        self.advanced_button.setText("詳細設定を開く")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.advanced_button.toggled.connect(self.toggle_advanced)
         self.start_button = QtWidgets.QPushButton("推論開始")
         self.start_button.setObjectName("startButton")
+        self.start_button.setMinimumWidth(110)
+        self.start_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.start_button.clicked.connect(self.start_queue)
         self.stop_button = QtWidgets.QPushButton("停止")
         self.stop_button.setObjectName("stopButton")
+        self.stop_button.setMinimumWidth(80)
+        self.stop_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.stop_button.clicked.connect(self.stop_process)
-        self.check_artifacts_button = QtWidgets.QPushButton("チェックポイント確認")
-        self.check_artifacts_button.clicked.connect(self.check_artifacts)
-        self.advanced_button = QtWidgets.QToolButton()
-        self.advanced_button.setText("詳細を開く")
-        self.advanced_button.setCheckable(True)
-        self.advanced_button.toggled.connect(self.toggle_advanced)
-
-        top.addWidget(QtWidgets.QLabel("Backend"), 0, 0)
-        top.addWidget(self.detector_combo, 0, 1)
-        top.addWidget(QtWidgets.QLabel("結果保存先"), 0, 2)
-        top.addWidget(self.output_edit, 0, 3)
-        top.addWidget(self.output_browse_button, 0, 4)
-        top.addWidget(self.start_button, 0, 5)
-        top.addWidget(self.stop_button, 1, 5)
-        top.addWidget(self.check_artifacts_button, 1, 0, 1, 2)
-        top.addWidget(self.advanced_button, 1, 2)
-        top.setColumnStretch(3, 1)
-        root.addLayout(top)
-
-        overlay = QtWidgets.QHBoxLayout()
-        self.detailed_overlay_check = QtWidgets.QCheckBox("詳細オーバーレイ")
-        self.detector_overlay_check = QtWidgets.QCheckBox("AI生成カバーオーバーレイ")
-        self.simple_overlay_check = QtWidgets.QCheckBox("簡易オーバーレイ")
-        self.detailed_overlay_check.setChecked(True)
-        overlay.addWidget(self.detailed_overlay_check)
-        overlay.addWidget(self.detector_overlay_check)
-        overlay.addWidget(self.simple_overlay_check)
-        overlay.addStretch(1)
-        root.addLayout(overlay)
+        actions.addWidget(self.check_artifacts_button)
+        actions.addWidget(self.advanced_button)
+        actions.addStretch(1)
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.stop_button)
+        root.addLayout(actions)
 
         self.advanced_box = self.build_advanced_box()
         self.advanced_box.setVisible(False)
@@ -187,8 +228,12 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         return box
 
     def build_advanced_box(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("詳細")
-        grid = QtWidgets.QGridLayout(box)
+        box = QtWidgets.QGroupBox("詳細設定")
+        box.setObjectName("advancedBox")
+        outer = QtWidgets.QVBoxLayout(box)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(8)
+
         self.run_prefix_edit = QtWidgets.QLineEdit(self.settings.run_prefix)
         self.force_check = QtWidgets.QCheckBox("既存結果を上書き")
         self.force_check.setChecked(True)
@@ -198,13 +243,16 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.max_frames_spin = QtWidgets.QSpinBox()
         self.max_frames_spin.setRange(0, 100_000_000)
         self.max_frames_spin.setSpecialValueText("既定")
+        self.max_frames_spin.setMinimumWidth(96)
         self.batch_size_spin = QtWidgets.QSpinBox()
         self.batch_size_spin.setRange(0, 4096)
         self.batch_size_spin.setSpecialValueText("既定")
+        self.batch_size_spin.setMinimumWidth(96)
         self.warmup_spin = QtWidgets.QSpinBox()
         self.warmup_spin.setRange(-1, 100_000)
         self.warmup_spin.setValue(-1)
         self.warmup_spin.setSpecialValueText("既定")
+        self.warmup_spin.setMinimumWidth(96)
         self.score_enable = QtWidgets.QCheckBox("score-thresh指定")
         self.score_spin = QtWidgets.QDoubleSpinBox()
         self.score_spin.setRange(0.0, 1.0)
@@ -212,45 +260,76 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.score_spin.setDecimals(3)
         self.score_spin.setValue(0.300)
         self.score_spin.setEnabled(False)
+        self.score_spin.setMinimumWidth(96)
         self.score_enable.toggled.connect(self.score_spin.setEnabled)
-        grid.addWidget(QtWidgets.QLabel("Run名Prefix"), 0, 0)
-        grid.addWidget(self.run_prefix_edit, 0, 1)
-        grid.addWidget(self.force_check, 0, 2)
-        grid.addWidget(self.recursive_check, 0, 3)
-        grid.addWidget(self.raw_cut_detect_check, 0, 4)
-        grid.addWidget(QtWidgets.QLabel("最大フレーム"), 1, 0)
-        grid.addWidget(self.max_frames_spin, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("batch-size"), 1, 2)
-        grid.addWidget(self.batch_size_spin, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("warmup"), 1, 4)
-        grid.addWidget(self.warmup_spin, 1, 5)
-        grid.addWidget(self.score_enable, 2, 0)
-        grid.addWidget(self.score_spin, 2, 1)
+
+        prefix_row = QtWidgets.QHBoxLayout()
+        prefix_row.setSpacing(8)
+        prefix_row.addWidget(self._form_label("Run名Prefix"))
+        prefix_row.addWidget(self.run_prefix_edit, 1)
+        outer.addLayout(prefix_row)
+
+        numeric_row = QtWidgets.QHBoxLayout()
+        numeric_row.setSpacing(8)
+        for label_text, widget in (
+            ("最大フレーム", self.max_frames_spin),
+            ("batch-size", self.batch_size_spin),
+            ("warmup", self.warmup_spin),
+        ):
+            numeric_row.addWidget(self._form_label(label_text))
+            numeric_row.addWidget(widget)
+            numeric_row.addSpacing(4)
+        numeric_row.addStretch(1)
+        outer.addLayout(numeric_row)
+
+        toggles_row = QtWidgets.QHBoxLayout()
+        toggles_row.setSpacing(16)
+        toggles_row.addWidget(self.force_check)
+        toggles_row.addWidget(self.recursive_check)
+        toggles_row.addWidget(self.raw_cut_detect_check)
+        toggles_row.addStretch(1)
+        outer.addLayout(toggles_row)
+
+        score_row = QtWidgets.QHBoxLayout()
+        score_row.setSpacing(8)
+        score_row.addWidget(self.score_enable)
+        score_row.addWidget(self.score_spin)
+        score_row.addStretch(1)
+        outer.addLayout(score_row)
         return box
 
     def build_queue_panel(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("入力動画キュー")
         layout = QtWidgets.QVBoxLayout(box)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
         self.queue_stack = QtWidgets.QStackedWidget()
-        self.empty_queue_label = QtWidgets.QLabel("動画がありません")
-        self.empty_queue_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self.empty_queue_label = QtWidgets.QLabel("動画がありません\n\n下のボタンから追加してください")
+        self.empty_queue_label.setObjectName("emptyState")
+        self.empty_queue_label.setAlignment(QtCore.Qt.AlignCenter)
         self.queue_list = QtWidgets.QListWidget()
+        self.queue_list.setObjectName("queueList")
         self.queue_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.queue_list.setAlternatingRowColors(True)
+        self.queue_list.setUniformItemSizes(True)
         self.queue_stack.addWidget(self.empty_queue_label)
         self.queue_stack.addWidget(self.queue_list)
         layout.addWidget(self.queue_stack, 1)
         buttons = QtWidgets.QHBoxLayout()
-        self.add_video_button = QtWidgets.QPushButton("追加")
+        buttons.setSpacing(6)
+        self.add_video_button = QtWidgets.QPushButton("動画追加")
         self.add_video_button.clicked.connect(self.add_videos)
-        self.add_folder_button = QtWidgets.QPushButton("フォルダ")
+        self.add_folder_button = QtWidgets.QPushButton("フォルダ追加")
         self.add_folder_button.clicked.connect(self.add_folder)
-        self.remove_button = QtWidgets.QPushButton("削除")
+        self.remove_button = QtWidgets.QPushButton("選択削除")
         self.remove_button.clicked.connect(self.remove_selected)
         self.clear_button = QtWidgets.QPushButton("全削除")
+        self.clear_button.setObjectName("dangerGhostButton")
         self.clear_button.clicked.connect(self.clear_queue)
-        for button in (self.add_video_button, self.add_folder_button, self.remove_button, self.clear_button):
+        for button in (self.add_video_button, self.add_folder_button, self.remove_button):
             buttons.addWidget(button)
         buttons.addStretch(1)
+        buttons.addWidget(self.clear_button)
         layout.addLayout(buttons)
         return box
 
@@ -262,88 +341,592 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
     def build_log_panel(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("実行ログ")
         layout = QtWidgets.QVBoxLayout(box)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
         self.log_edit = QtWidgets.QPlainTextEdit()
+        self.log_edit.setObjectName("logEdit")
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumBlockCount(5000)
+        self.log_edit.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.log_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         layout.addWidget(self.log_edit)
         return box
 
     def build_postprocess_panel(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("自動後処理設定")
-        grid = QtWidgets.QGridLayout(box)
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(8)
         self.postprocess_check = QtWidgets.QCheckBox("推論後に自動で後処理を実行")
         self.postprocess_check.setChecked(True)
         self.postprocess_check.toggled.connect(self.update_postprocess_enabled)
         self.class_tabs = QtWidgets.QTabWidget()
+        self.class_tabs.setObjectName("classTabs")
+        self.class_tabs.setDocumentMode(True)
+        self.class_tabs.setElideMode(QtCore.Qt.ElideRight)
+        self.class_tabs.setUsesScrollButtons(False)
+        self.class_tabs.tabBar().setExpanding(False)
         self.class_shape_combos: dict[str, ClosingComboBox] = {}
         self.class_keyframe_spins: dict[str, QtWidgets.QSpinBox] = {}
         self.class_recall_spins: dict[str, QtWidgets.QDoubleSpinBox] = {}
         self.class_confidence_spins: dict[str, QtWidgets.QDoubleSpinBox] = {}
         for name in ("女性器", "男性器", "結合部分"):
             page = QtWidgets.QWidget()
-            page_layout = QtWidgets.QGridLayout(page)
+            grid = QtWidgets.QGridLayout(page)
+            grid.setContentsMargins(10, 12, 10, 10)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(8)
             shape = ClosingComboBox()
             shape.addItem("楕円近似", "ellipse")
             shape.addItem("ポリゴン", "polygon")
             shape.setCurrentIndex(1 if name == "男性器" else 0)
+            shape.setMinimumWidth(110)
+            shape.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             keyframe = QtWidgets.QSpinBox()
             keyframe.setRange(1, 300)
             keyframe.setValue(3)
+            keyframe.setMinimumWidth(80)
+            keyframe.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             recall = QtWidgets.QDoubleSpinBox()
             recall.setRange(0.001, 1.0)
             recall.setDecimals(3)
             recall.setSingleStep(0.005)
             recall.setValue(0.960)
+            recall.setMinimumWidth(80)
+            recall.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             confidence = QtWidgets.QDoubleSpinBox()
             confidence.setRange(0.0, 1.0)
             confidence.setDecimals(3)
             confidence.setSingleStep(0.005)
             confidence.setValue(0.350)
+            confidence.setMinimumWidth(80)
+            confidence.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             self.class_shape_combos[name] = shape
             self.class_keyframe_spins[name] = keyframe
             self.class_recall_spins[name] = recall
             self.class_confidence_spins[name] = confidence
-            page_layout.addWidget(QtWidgets.QLabel("マスクタイプ"), 0, 0)
-            page_layout.addWidget(shape, 0, 1)
-            page_layout.addWidget(QtWidgets.QLabel("キーフレーム間隔"), 0, 2)
-            page_layout.addWidget(keyframe, 0, 3)
-            page_layout.addWidget(QtWidgets.QLabel("recall閾値"), 1, 0)
-            page_layout.addWidget(recall, 1, 1)
-            page_layout.addWidget(QtWidgets.QLabel("confidence閾値"), 1, 2)
-            page_layout.addWidget(confidence, 1, 3)
+            grid.addWidget(self._form_label("マスクタイプ"), 0, 0)
+            grid.addWidget(shape, 0, 1)
+            grid.addWidget(self._form_label("キーフレーム間隔"), 0, 2)
+            grid.addWidget(keyframe, 0, 3)
+            grid.addWidget(self._form_label("recall閾値"), 1, 0)
+            grid.addWidget(recall, 1, 1)
+            grid.addWidget(self._form_label("confidence閾値"), 1, 2)
+            grid.addWidget(confidence, 1, 3)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(3, 1)
+            grid.setRowStretch(2, 1)
             self.class_tabs.addTab(page, name)
-        grid.addWidget(self.postprocess_check, 0, 0, 1, 3)
-        grid.addWidget(self.class_tabs, 1, 0, 1, 3)
+        layout.addWidget(self.postprocess_check)
+        layout.addWidget(self.class_tabs, 1)
         self.update_postprocess_enabled(True)
         return box
 
+    def _ensure_icon_assets(self) -> dict[str, str]:
+        from .settings import app_data_dir
+
+        assets_dir = app_data_dir() / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        check_path = assets_dir / "check_white.png"
+        if not check_path.exists():
+            image = QtGui.QImage(32, 32, QtGui.QImage.Format_ARGB32)
+            image.fill(QtCore.Qt.transparent)
+            painter = QtGui.QPainter(image)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            pen = QtGui.QPen(QtGui.QColor("#ffffff"))
+            pen.setWidthF(4.0)
+            pen.setCapStyle(QtCore.Qt.RoundCap)
+            pen.setJoinStyle(QtCore.Qt.RoundJoin)
+            painter.setPen(pen)
+            path = QtGui.QPainterPath()
+            path.moveTo(7.0, 17.0)
+            path.lineTo(13.5, 23.5)
+            path.lineTo(25.0, 10.0)
+            painter.drawPath(path)
+            painter.end()
+            image.save(str(check_path), "PNG")
+        return {"check": str(check_path).replace("\\", "/")}
+
     def apply_style(self) -> None:
+        icons = self._ensure_icon_assets()
         self.setStyleSheet(
-            """
-            QWidget#centralRoot { background: #f3f5f8; }
-            QWidget { font-size: 12px; color: #1f2933; }
-            QGroupBox { background: #ffffff; border: 1px solid #d7dde5; border-radius: 6px; margin-top: 8px; padding-top: 8px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #344054; }
-            QPushButton { min-height: 26px; padding: 2px 10px; }
-            QPushButton#startButton { background: #1565c0; color: white; border: 0; border-radius: 4px; }
-            QPushButton#stopButton { background: #b42318; color: white; border: 0; border-radius: 4px; }
-            QLabel#statusBanner { background: #e8f1ff; border-radius: 4px; padding: 6px; font-weight: 600; }
-            QFrame#metricCard { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; }
-            QLabel#metricKey { color: #667085; font-size: 11px; }
-            QLabel#metricValue { font-weight: 600; }
-            QLabel#statusKey { color: #667085; padding: 2px 4px; }
-            QLabel#statusValue { padding: 2px 4px; }
-            QPlainTextEdit#logEdit { font-family: Consolas, "Courier New", monospace; font-size: 11px; }
-            """
+            ("""
+            /* ====== Base ====== */
+            QWidget {
+                font-family: "Segoe UI", "Yu Gothic UI", "Meiryo UI", sans-serif;
+                font-size: 12px;
+                color: #1d2939;
+            }
+            QWidget#centralRoot { background: #f4f6f9; }
+            QToolTip {
+                background: #1d2939;
+                color: #f9fafb;
+                border: 0;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }
+
+            /* ====== Group boxes (cards) ====== */
+            QGroupBox {
+                background: #ffffff;
+                border: 1px solid #e4e7ec;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 2px;
+                font-weight: 600;
+                color: #1d2939;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 0 6px;
+                color: #344054;
+            }
+            QGroupBox#advancedBox {
+                background: #fafbfc;
+                border: 1px solid #eaecf0;
+            }
+            QScrollArea#dashboardScroll {
+                background: transparent;
+                border: 0;
+            }
+            QScrollArea#dashboardScroll > QWidget > QWidget {
+                background: transparent;
+            }
+
+            /* ====== Labels ====== */
+            QLabel { background: transparent; color: #344054; }
+            QLabel#formLabel { color: #475467; font-weight: 500; }
+            QLabel#sectionLabel { color: #667085; font-weight: 600; font-size: 11px; padding-right: 4px; }
+            QLabel#emptyState { color: #98a2b3; font-style: italic; }
+            QLabel#runtimeInfo {
+                color: #475467;
+                background: #f9fafb;
+                border: 1px solid #eaecf0;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }
+
+            /* ====== Buttons ====== */
+            QPushButton {
+                background: #ffffff;
+                color: #344054;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                padding: 5px 14px;
+                min-height: 26px;
+                min-width: 64px;
+            }
+            QPushButton:hover { background: #f9fafb; border-color: #98a2b3; color: #1d2939; }
+            QPushButton:pressed { background: #f2f4f7; }
+            QPushButton:disabled { background: #f9fafb; color: #b5bcc4; border-color: #eaecf0; }
+
+            QPushButton#startButton {
+                background: #2563eb;
+                color: #ffffff;
+                border: 1px solid #2563eb;
+                font-weight: 600;
+                padding: 6px 18px;
+            }
+            QPushButton#startButton:hover { background: #1d4ed8; border-color: #1d4ed8; }
+            QPushButton#startButton:pressed { background: #1e40af; border-color: #1e40af; }
+            QPushButton#startButton:disabled { background: #cdd5e0; color: #ffffff; border-color: #cdd5e0; }
+
+            QPushButton#stopButton {
+                background: #ffffff;
+                color: #b42318;
+                border: 1px solid #fda29b;
+                font-weight: 600;
+                padding: 6px 16px;
+            }
+            QPushButton#stopButton:hover { background: #fef3f2; border-color: #f97066; color: #912018; }
+            QPushButton#stopButton:pressed { background: #fee4e2; }
+            QPushButton#stopButton:disabled { background: #fdf3f2; color: #e3b5b0; border-color: #fbe4e2; }
+
+            QPushButton#secondaryButton {
+                background: #eff4ff;
+                color: #1d4ed8;
+                border: 1px solid #d6e4ff;
+            }
+            QPushButton#secondaryButton:hover { background: #dde7ff; border-color: #b2ccff; }
+            QPushButton#secondaryButton:pressed { background: #c5d6ff; }
+            QPushButton#secondaryButton:disabled { background: #f4f6fa; color: #b5bcc4; border-color: #eaecf0; }
+
+            QPushButton#dangerGhostButton {
+                background: transparent;
+                color: #b42318;
+                border: 1px solid #eaecf0;
+            }
+            QPushButton#dangerGhostButton:hover { background: #fef3f2; border-color: #fda29b; }
+            QPushButton#dangerGhostButton:disabled { color: #d6bbbb; border-color: #eaecf0; }
+
+            QToolButton#advancedToggle {
+                background: transparent;
+                color: #475467;
+                border: 1px solid #e4e7ec;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-weight: 500;
+            }
+            QToolButton#advancedToggle:hover { background: #f2f4f7; color: #1d2939; }
+            QToolButton#advancedToggle:checked {
+                background: #eff4ff;
+                color: #1d4ed8;
+                border-color: #b2ccff;
+            }
+
+            /* ====== Inputs ====== */
+            QLineEdit, QPlainTextEdit, QTextEdit {
+                background: #ffffff;
+                color: #1d2939;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                padding: 5px 8px;
+                selection-background-color: #b2ccff;
+                selection-color: #1d2939;
+            }
+            QLineEdit:hover, QPlainTextEdit:hover, QTextEdit:hover { border-color: #98a2b3; }
+            QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus { border-color: #2563eb; }
+            QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {
+                background: #f9fafb; color: #98a2b3; border-color: #eaecf0;
+            }
+            QLineEdit:read-only, QPlainTextEdit:read-only, QTextEdit:read-only {
+                background: #fafbfc;
+            }
+
+            QComboBox {
+                background: #ffffff;
+                color: #1d2939;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                padding: 4px 10px;
+                min-height: 24px;
+            }
+            QComboBox:hover { border-color: #98a2b3; }
+            QComboBox:focus { border-color: #2563eb; }
+            QComboBox:on { border-color: #2563eb; }
+            QComboBox:disabled { background: #f9fafb; color: #98a2b3; border-color: #eaecf0; }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 22px;
+                border: 0;
+                background: transparent;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0; height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #667085;
+                margin-right: 8px;
+            }
+            QComboBox::down-arrow:disabled {
+                border-top-color: #cbd5e1;
+            }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                color: #1d2939;
+                border: 1px solid #d0d5dd;
+                selection-background-color: #eff4ff;
+                selection-color: #1d4ed8;
+                outline: 0;
+                padding: 2px;
+            }
+
+            QSpinBox, QDoubleSpinBox {
+                background: #ffffff;
+                color: #1d2939;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                padding: 4px 6px;
+                min-height: 24px;
+            }
+            QSpinBox:hover, QDoubleSpinBox:hover { border-color: #98a2b3; }
+            QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2563eb; }
+            QSpinBox:disabled, QDoubleSpinBox:disabled { background: #f9fafb; color: #98a2b3; border-color: #eaecf0; }
+            QSpinBox::up-button, QDoubleSpinBox::up-button,
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                subcontrol-origin: border;
+                width: 16px;
+                border: 0;
+                background: transparent;
+            }
+            QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-position: top right; }
+            QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-position: bottom right; }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background: #f2f4f7; }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: none; width: 0; height: 0;
+                border-left: 3px solid transparent;
+                border-right: 3px solid transparent;
+                border-bottom: 4px solid #667085;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: none; width: 0; height: 0;
+                border-left: 3px solid transparent;
+                border-right: 3px solid transparent;
+                border-top: 4px solid #667085;
+            }
+            QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled { border-bottom-color: #cbd5e1; }
+            QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled { border-top-color: #cbd5e1; }
+
+            /* ====== Checkboxes ====== */
+            QCheckBox {
+                color: #344054;
+                spacing: 8px;
+                padding: 3px 2px;
+            }
+            QCheckBox:disabled { color: #b5bcc4; }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:hover { border-color: #2563eb; }
+            QCheckBox::indicator:focus { border-color: #2563eb; }
+            QCheckBox::indicator:checked {
+                background: #2563eb;
+                border: 1px solid #2563eb;
+                image: url("__CHECK_ICON__");
+            }
+            QCheckBox::indicator:checked:hover { background: #1d4ed8; border-color: #1d4ed8; }
+            QCheckBox::indicator:indeterminate {
+                background: #b2ccff;
+                border: 1px solid #2563eb;
+            }
+            QCheckBox::indicator:disabled { background: #f2f4f7; border-color: #e4e7ec; }
+            QCheckBox::indicator:checked:disabled { background: #cbd5e1; border-color: #cbd5e1; }
+
+            /* ====== Radio buttons ====== */
+            QRadioButton { color: #344054; spacing: 8px; padding: 3px 2px; }
+            QRadioButton:disabled { color: #b5bcc4; }
+            QRadioButton::indicator {
+                width: 16px; height: 16px;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                background: #ffffff;
+            }
+            QRadioButton::indicator:hover { border-color: #2563eb; }
+            QRadioButton::indicator:checked {
+                background: #2563eb;
+                border: 4px solid #ffffff;
+                outline: 1px solid #2563eb;
+            }
+            QRadioButton::indicator:disabled { background: #f2f4f7; border-color: #e4e7ec; }
+
+            /* ====== Tabs ====== */
+            QTabWidget::pane {
+                background: #ffffff;
+                border: 1px solid #e4e7ec;
+                border-radius: 8px;
+                top: -1px;
+            }
+            QTabWidget#classTabs::pane {
+                background: #fafbfc;
+            }
+            QTabBar { qproperty-drawBase: 0; background: transparent; }
+            QTabBar::tab {
+                background: #f2f4f7;
+                color: #667085;
+                padding: 6px 18px;
+                margin-right: 4px;
+                margin-top: 2px;
+                border: 1px solid transparent;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                min-width: 70px;
+                font-weight: 500;
+            }
+            QTabBar::tab:hover { background: #e9ecf2; color: #344054; }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #1d4ed8;
+                border: 1px solid #e4e7ec;
+                border-bottom-color: #ffffff;
+                font-weight: 600;
+                margin-top: 0px;
+            }
+            QTabWidget#classTabs QTabBar::tab:selected { border-bottom-color: #fafbfc; }
+            QTabBar::tab:disabled { color: #b5bcc4; background: #f9fafb; }
+            QTabBar::tear { width: 0; height: 0; }
+
+            /* ====== List widgets ====== */
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                padding: 4px;
+                outline: 0;
+                alternate-background-color: #fafbfc;
+            }
+            QListWidget::item {
+                padding: 6px 8px;
+                border-radius: 4px;
+                color: #1d2939;
+            }
+            QListWidget::item:hover { background: #f2f4f7; }
+            QListWidget::item:selected {
+                background: #eff4ff;
+                color: #1d4ed8;
+            }
+            QListWidget#queueList::item { padding: 6px 10px; }
+
+            /* ====== Progress bars ====== */
+            QProgressBar {
+                background: #eef0f4;
+                border: 1px solid #e4e7ec;
+                border-radius: 6px;
+                text-align: center;
+                color: #344054;
+                font-weight: 500;
+                min-height: 18px;
+            }
+            QProgressBar::chunk {
+                background: #2563eb;
+                border-radius: 5px;
+                margin: 1px;
+            }
+            QProgressBar#phaseProgress::chunk { background: #38bdf8; }
+
+            /* ====== Splitters ====== */
+            QSplitter#bodySplitter::handle {
+                background: transparent;
+            }
+            QSplitter#bodySplitter::handle:vertical {
+                height: 8px;
+                margin: 1px 24px;
+                background: #e4e7ec;
+                border-radius: 3px;
+            }
+            QSplitter#bodySplitter::handle:vertical:hover { background: #98a2b3; }
+            QSplitter#bodySplitter::handle:horizontal {
+                width: 8px;
+                margin: 24px 1px;
+                background: #e4e7ec;
+                border-radius: 3px;
+            }
+            QSplitter#bodySplitter::handle:horizontal:hover { background: #98a2b3; }
+
+            /* ====== Scrollbars ====== */
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 2px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #cbd5e1;
+                border-radius: 4px;
+                min-height: 28px;
+                margin: 0 2px;
+            }
+            QScrollBar::handle:vertical:hover { background: #98a2b3; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                background: transparent; height: 0; border: 0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+
+            QScrollBar:horizontal {
+                background: transparent;
+                height: 10px;
+                margin: 0 2px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #cbd5e1;
+                border-radius: 4px;
+                min-width: 28px;
+                margin: 2px 0;
+            }
+            QScrollBar::handle:horizontal:hover { background: #98a2b3; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                background: transparent; width: 0; border: 0;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+
+            /* ====== Progress dashboard ====== */
+            QLabel#statusBanner {
+                background: #f2f4f7;
+                color: #475467;
+                border: 1px solid #e4e7ec;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QLabel#statusBanner[state="idle"] {
+                background: #f2f4f7;
+                color: #475467;
+                border-color: #e4e7ec;
+            }
+            QLabel#statusBanner[state="running"] {
+                background: #eff4ff;
+                color: #1d4ed8;
+                border-color: #b2ccff;
+            }
+            QLabel#statusBanner[state="done"] {
+                background: #ecfdf5;
+                color: #047857;
+                border-color: #a7f3d0;
+            }
+            QLabel#statusBanner[state="error"] {
+                background: #fef3f2;
+                color: #b42318;
+                border-color: #fda29b;
+            }
+            QLabel#statusBanner[state="stopped"] {
+                background: #fffaeb;
+                color: #92400e;
+                border-color: #fde68a;
+            }
+            QFrame#metricCard {
+                background: #f9fafb;
+                border: 1px solid #eaecf0;
+                border-radius: 6px;
+            }
+            QLabel#metricKey {
+                color: #667085;
+                font-size: 10px;
+                font-weight: 500;
+            }
+            QLabel#metricValue {
+                color: #1d2939;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QLabel#statusKey {
+                color: #667085;
+                font-size: 11px;
+                padding: 1px 4px 1px 0;
+            }
+            QLabel#statusValue {
+                color: #1d2939;
+                padding: 1px 4px;
+            }
+            QPlainTextEdit#logEdit {
+                font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+                font-size: 11px;
+                color: #344054;
+                background: #fafbfc;
+                border: 1px solid #e4e7ec;
+            }
+            QPlainTextEdit#summaryText {
+                background: #f9fafb;
+                color: #475467;
+                font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+                font-size: 11px;
+                border: 1px solid #eaecf0;
+            }
+            """).replace("__CHECK_ICON__", icons["check"])
         )
 
     def refresh_wsl_distros(self) -> None:
         current = self.wsl_combo.currentText() if self.wsl_combo.count() else self.settings.wsl_distro
         distros = [current or "Ubuntu"]
         try:
-            completed = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True, check=False, text=True, timeout=5)
-            found = [line.strip("\x00 \r") for line in completed.stdout.splitlines()]
-            distros = [line for line in found if line] or distros
+            distros = WslBridge.list_distros() or distros
         except Exception:
             pass
         self.wsl_combo.clear()
@@ -353,6 +936,44 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             self.wsl_combo.setCurrentIndex(index)
         else:
             self.wsl_combo.setEditText(current)
+
+    def discover_runtime(self, *, silent: bool) -> bool:
+        if silent and self.wsl_repo_edit.text().strip():
+            try:
+                self.current_bridge().load_runtime()
+                return False
+            except Exception:
+                pass
+        self.refresh_wsl_distros()
+        distros: list[str] = []
+        current = self.wsl_combo.currentText().strip() or self.settings.wsl_distro or "Ubuntu"
+        if current:
+            distros.append(current)
+        for index in range(self.wsl_combo.count()):
+            distro = self.wsl_combo.itemText(index).strip()
+            if distro and distro not in distros:
+                distros.append(distro)
+        for distro in distros or ["Ubuntu"]:
+            try:
+                candidates = WslBridge.discover_repo_paths(distro)
+            except Exception:
+                candidates = []
+            if not candidates:
+                continue
+            self.wsl_combo.setEditText(distro)
+            self.wsl_repo_edit.setText(candidates[0])
+            self.runtime_info_label.setText(f"自動探索: {distro} {candidates[0]}")
+            if not silent:
+                QtWidgets.QMessageBox.information(self, "WSL runtime found", f"{distro}\n{candidates[0]}")
+            return True
+        if not silent:
+            self.runtime_info_label.setText("自動探索: Dinov3_postprocess が見つかりません")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "WSL runtime not found",
+                "WSL 内で Dinov3_postprocess が見つかりませんでした。Distro と WSL repo を手動で指定してください。",
+            )
+        return False
 
     def current_bridge(self) -> WslBridge:
         return WslBridge(self.wsl_combo.currentText().strip() or "Ubuntu", self.wsl_repo_edit.text().strip())
@@ -367,12 +988,22 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             if not silent:
                 QtWidgets.QMessageBox.warning(self, "WSL接続失敗", str(exc))
             return False
+        summary = self.bridge.setup_summary()
+        if not silent:
+            checks = self.bridge.validate_runtime(self.runtime)
+            ok = all(item_ok for _name, item_ok, _detail in checks)
+            lines = [summary, *[f"{'OK' if item_ok else 'NG'} {name}: {detail}" for name, item_ok, detail in checks]]
+            self.runtime_info_label.setText("\n".join(lines))
+            if not ok:
+                QtWidgets.QMessageBox.warning(self, "WSL接続確認", "一部の接続確認に失敗しました。Runtime 表示の NG 項目を確認してください。")
+                return False
         self.settings.wsl_distro = self.bridge.distro
         self.settings.wsl_repo_path = self.bridge.repo_path
         self.settings.windows_output_dir = self.output_edit.text() if hasattr(self, "output_edit") else self.settings.windows_output_dir
         self.settings.run_prefix = self.run_prefix_edit.text() if hasattr(self, "run_prefix_edit") else self.settings.run_prefix
         self.settings.save()
-        self.runtime_info_label.setText(self.bridge.setup_summary())
+        if silent:
+            self.runtime_info_label.setText(summary)
         return True
 
     def browse_output_dir(self) -> None:
@@ -400,10 +1031,17 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             resolved = normalize_windows_path(path)
             if str(resolved) in existing:
                 continue
-            if not resolved.exists():
+            try:
+                exists = resolved.exists()
+                is_file = resolved.is_file()
+                suffix = resolved.suffix.lower()
+            except OSError as exc:
+                self.append_log(f"[skip] cannot access: {resolved} ({exc})")
+                continue
+            if not exists:
                 self.append_log(f"[skip] not found: {resolved}")
                 continue
-            if resolved.is_file() and resolved.suffix.lower() not in VIDEO_EXTS:
+            if is_file and suffix not in VIDEO_EXTS:
                 self.append_log(f"[skip] unsupported file: {resolved}")
                 continue
             self.queue_paths.append(resolved)
@@ -455,7 +1093,11 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             self.summary_text.setPlainText("status: error\nqueue: no supported videos")
             return
         output_root = normalize_windows_path(self.output_edit.text())
-        output_root.mkdir(parents=True, exist_ok=True)
+        try:
+            output_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.report_local_error("出力先を作成できません", f"{output_root}\n{exc}")
+            return
         self.settings.windows_output_dir = str(output_root)
         self.settings.run_prefix = self.run_prefix_edit.text()
         self.settings.save()
@@ -500,12 +1142,16 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         expanded: list[Path] = []
         seen: set[str] = set()
         for path in self.queue_paths:
-            if path.is_file():
-                candidates = [path]
-            elif path.is_dir():
-                iterator = path.rglob("*") if self.recursive_check.isChecked() else path.iterdir()
-                candidates = sorted(candidate for candidate in iterator if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTS)
-            else:
+            try:
+                if path.is_file():
+                    candidates = [path]
+                elif path.is_dir():
+                    iterator = path.rglob("*") if self.recursive_check.isChecked() else path.iterdir()
+                    candidates = sorted(candidate for candidate in iterator if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTS)
+                else:
+                    continue
+            except OSError as exc:
+                self.append_log(f"[skip] cannot enumerate: {path} ({exc})")
                 continue
             for candidate in candidates:
                 key = str(candidate)
@@ -521,7 +1167,12 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             return
         path = self.run_queue[self.current_index]
         self.active_progress_phase_key = ""
-        command = self.build_command(path, self.current_index)
+        try:
+            command = self.build_command(path, self.current_index)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.append_log(f"[error] failed to prepare job: {exc}")
+            self.report_local_error("ジョブを開始できません", str(exc), finish_workflow=True)
+            return
         self.current_run_name = self.extract_run_name(command)
         output_root = normalize_windows_path(self.output_edit.text())
         self.current_summary_path = output_root / self.current_run_name / "summary.json"
@@ -559,10 +1210,89 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         except Exception:
             return None
 
+    def staging_output_root_wsl(self, run_name: str) -> str:
+        assert self.runtime is not None
+        base = self.runtime.gui_runtime_env.get("WINDOWS_FRONTEND_STAGING_ROOT")
+        if not base:
+            base = f"{self.bridge.repo_path.rstrip('/')}/.runtime/windows_frontend_staging"
+        return f"{base.rstrip('/')}/{run_name}"
+
+    def quote_wsl(self, value: str | Path) -> str:
+        return shlex.quote(str(value))
+
+    def final_copy_cleanup_script(
+        self,
+        *,
+        inner: list[str],
+        staging_root: str,
+        run_name: str,
+        final_root: str,
+        final_run_windows: Path,
+    ) -> str:
+        staging_run_dir = f"{staging_root.rstrip('/')}/{run_name}"
+        final_run_dir = f"{final_root.rstrip('/')}/{run_name}"
+        final_run_windows_text = str(final_run_windows).replace("\\", "/")
+        self.last_built_staging_output_root_wsl = staging_root
+        self.last_built_staging_run_dir_wsl = staging_run_dir
+        self.last_built_final_run_dir_wsl = final_run_dir
+        rewrite_code = (
+            "from pathlib import Path, PureWindowsPath\n"
+            "import os\n"
+            "root = Path(os.environ['CODX_FINAL_RUN'])\n"
+            "final_win = (os.environ.get('CODX_FINAL_WIN') or os.environ['CODX_FINAL_RUN']).replace(chr(92), '/')\n"
+            "parent_win = str(PureWindowsPath(final_win).parent).replace(chr(92), '/')\n"
+            "pairs = [\n"
+            "    (os.environ['CODX_STAGING_RUN'], final_win),\n"
+            "    (os.environ['CODX_STAGING_ROOT'], parent_win),\n"
+            "    (os.environ['CODX_FINAL_RUN'], final_win),\n"
+            "]\n"
+            "suffixes = {'.json', '.jsonl', '.txt', '.log', '.md', '.csv'}\n"
+            "for path in root.rglob('*'):\n"
+            "    if not path.is_file() or path.suffix.lower() not in suffixes:\n"
+            "        continue\n"
+            "    try:\n"
+            "        text = path.read_text(encoding='utf-8')\n"
+            "    except (OSError, UnicodeDecodeError):\n"
+            "        continue\n"
+            "    updated = text\n"
+            "    for old, new in pairs:\n"
+            "        updated = updated.replace(old, new)\n"
+            "    if updated != text:\n"
+            "        path.write_text(updated, encoding='utf-8')\n"
+        )
+
+        steps = [
+            f"mkdir -p {self.quote_wsl(staging_root)} {self.quote_wsl(final_root)}",
+        ]
+        if self.force_check.isChecked():
+            steps.append(f"rm -rf {self.quote_wsl(final_run_dir)}")
+        else:
+            steps.append(
+                f"if [ -e {self.quote_wsl(final_run_dir)} ]; then "
+                f"echo {self.quote_wsl('[error] final output already exists: ' + final_run_dir)}; exit 2; fi"
+            )
+        steps.extend(
+            [
+                self.bridge.quote_command(inner),
+                f"test -d {self.quote_wsl(staging_run_dir)}",
+                f"mkdir -p {self.quote_wsl(final_root)}",
+                f"cp -a {self.quote_wsl(staging_run_dir)} {self.quote_wsl(final_root)}/",
+                "export "
+                f"CODX_STAGING_ROOT={self.quote_wsl(staging_root)} "
+                f"CODX_STAGING_RUN={self.quote_wsl(staging_run_dir)} "
+                f"CODX_FINAL_RUN={self.quote_wsl(final_run_dir)} "
+                f"CODX_FINAL_WIN={self.quote_wsl(final_run_windows_text)}",
+                f"{self.quote_wsl(self.runtime.python if self.runtime else 'python3')} -c {self.quote_wsl(rewrite_code)}",
+                f"rm -rf {self.quote_wsl(staging_root)}",
+                f"echo {self.quote_wsl('[windows-output] ' + final_run_windows_text)}",
+            ]
+        )
+        return "; ".join(steps)
+
     def build_command(self, input_path: Path, index: int) -> list[str]:
         assert self.runtime is not None
         detector = str(self.detector_combo.currentData())
-        output_root = normalize_windows_path(self.output_edit.text())
+        final_output_root = normalize_windows_path(self.output_edit.text())
         prefix = clean_run_part(self.run_prefix_edit.text() or "ui_run")
         run_name = f"{prefix}_{timestamp()}_{index + 1:02d}_{clean_run_part(input_path.stem)}"
         self.last_built_run_name = run_name
@@ -579,14 +1309,16 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             overlay_mode = "none"
 
         input_wsl = windows_path_to_wsl(input_path)
-        output_wsl = windows_path_to_wsl(output_root)
+        final_output_wsl = windows_path_to_wsl(final_output_root)
+        staging_output_wsl = self.staging_output_root_wsl(run_name)
+        staging_output_unc = Path(wsl_path_to_unc(self.bridge.distro, staging_output_wsl))
         pipeline_command = [
             self.runtime.python,
             "scripts/run_integrated_pipeline.py",
             "--input",
             input_wsl,
             "--output-root",
-            output_wsl,
+            staging_output_wsl,
             "--run-name",
             run_name,
             "--detector",
@@ -596,7 +1328,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             "5",
         ]
         if postprocess:
-            policy_path = self.write_policy_file(output_root, run_name)
+            policy_path = self.write_policy_file(staging_output_unc, run_name)
             pipeline_command.extend(
                 [
                     "--intervals",
@@ -644,7 +1376,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             "--input",
             input_wsl,
             "--output-root",
-            output_wsl,
+            staging_output_wsl,
             "--run-name",
             run_name,
             "--overlay-mode",
@@ -657,7 +1389,14 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             inner.append("--force")
         inner.append("--")
         inner.extend(pipeline_command)
-        return self.bridge.job_command(inner)
+        script = self.final_copy_cleanup_script(
+            inner=inner,
+            staging_root=staging_output_wsl,
+            run_name=run_name,
+            final_root=final_output_wsl,
+            final_run_windows=final_output_root / run_name,
+        )
+        return self.bridge.job_script_command(script)
 
     def add_detector_options(self, command: list[str], detector: str) -> None:
         if detector == "eva02":
@@ -772,9 +1511,11 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.progress_dashboard.set_phase_indeterminate()
         self.append_log("[runtime] " + (self.bridge.setup_summary() if self.runtime else "not connected"))
         self.append_log("[cmd] " + as_command_text(command))
-        self.process.start(command[0], command[1:])
+        launch_command = hidden_windows_process_command(command)
+        self.process.start(launch_command[0], launch_command[1:])
         if not self.process.waitForStarted(3000):
-            self.append_log(f"[error] failed to start: {label}")
+            detail = self.process.errorString() if self.process is not None else ""
+            self.append_log(f"[error] failed to start: {label}" + (f" ({detail})" if detail else ""))
             self.handle_start_failure(tool_only=tool_only)
 
     def handle_start_failure(self, *, tool_only: bool) -> None:
@@ -937,9 +1678,18 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.finish_queue(success=False, exit_code=exit_code)
 
     def process_error(self, error: QtCore.QProcess.ProcessError) -> None:
-        self.append_log(f"[process-error] {error}")
+        detail = self.process.errorString() if self.process is not None else ""
+        self.append_log(f"[process-error] {error}" + (f" {detail}" if detail else ""))
         self.status_value_label.setText("error")
         self.status_banner.setText("エラー")
+
+    def report_local_error(self, title: str, detail: str, *, finish_workflow: bool = False) -> None:
+        self.append_log(f"[error] {title}: {detail}")
+        if finish_workflow and self.workflow_running:
+            self.finish_queue(success=False, exit_code=-1)
+        self.status_banner.setText("エラー")
+        self.status_value_label.setText(title)
+        self.summary_text.setPlainText(f"status: error\n{title}\n{detail}")
 
     def finish_queue(self, *, success: bool, exit_code: int = 0) -> None:
         self.elapsed_timer.stop()
@@ -987,6 +1737,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.remove_button.setEnabled(bool(self.queue_paths) and not running)
         self.clear_button.setEnabled(bool(self.queue_paths) and not running)
         self.test_connection_button.setEnabled(not running)
+        self.discover_runtime_button.setEnabled(not running)
 
     def update_postprocess_enabled(self, enabled: bool) -> None:
         widgets = [

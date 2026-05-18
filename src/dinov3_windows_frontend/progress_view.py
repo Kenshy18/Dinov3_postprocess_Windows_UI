@@ -19,6 +19,41 @@ PHASE_LABELS = {
 }
 
 
+class StatusBanner(QtWidgets.QLabel):
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.setObjectName("statusBanner")
+        self.setProperty("state", self._detect_state(text))
+        self.setAlignment(QtCore.Qt.AlignCenter)
+
+    @staticmethod
+    def _detect_state(text: str) -> str:
+        value = (text or "").strip()
+        if not value:
+            return "idle"
+        if "エラー" in value or "失敗" in value:
+            return "error"
+        if "停止" in value:
+            return "stopped"
+        if "完了" in value:
+            return "done"
+        if "実行中" in value or "起動中" in value:
+            return "running"
+        if "待機" in value:
+            return "idle"
+        return "running"
+
+    def setText(self, text: str) -> None:  # type: ignore[override]
+        state = self._detect_state(text)
+        if self.property("state") != state:
+            self.setProperty("state", state)
+            style = self.style()
+            if style is not None:
+                style.unpolish(self)
+                style.polish(self)
+        super().setText(text)
+
+
 def progress_float(fields: dict[str, str], key: str) -> float | None:
     value = fields.get(key)
     if value in (None, "", "-"):
@@ -95,26 +130,46 @@ class ProgressDashboard(QtWidgets.QGroupBox):
         self._build()
 
     def _build(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 10, 8, 8)
-        layout.setSpacing(6)
-        self.status_banner = QtWidgets.QLabel("待機中")
-        self.status_banner.setObjectName("statusBanner")
-        self.status_banner.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.status_banner)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(10, 12, 10, 10)
+        outer.setSpacing(8)
+
+        self.status_banner = StatusBanner("待機中")
+        outer.addWidget(self.status_banner)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setObjectName("dashboardScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll, 1)
+
+        container = QtWidgets.QWidget()
+        container.setObjectName("dashboardContent")
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        scroll.setWidget(container)
 
         progress_grid = QtWidgets.QGridLayout()
+        progress_grid.setHorizontalSpacing(10)
+        progress_grid.setVerticalSpacing(4)
         self.total_progress = QtWidgets.QProgressBar()
+        self.total_progress.setObjectName("totalProgress")
         self.phase_progress = QtWidgets.QProgressBar()
+        self.phase_progress.setObjectName("phaseProgress")
         self.total_progress.setRange(0, 1)
         self.phase_progress.setRange(0, 1)
-        progress_grid.addWidget(QtWidgets.QLabel("全体"), 0, 0)
+        progress_grid.addWidget(self._key_label("全体"), 0, 0)
         progress_grid.addWidget(self.total_progress, 0, 1)
-        progress_grid.addWidget(QtWidgets.QLabel("フェーズ"), 1, 0)
+        progress_grid.addWidget(self._key_label("フェーズ"), 1, 0)
         progress_grid.addWidget(self.phase_progress, 1, 1)
+        progress_grid.setColumnStretch(1, 1)
         layout.addLayout(progress_grid)
 
         metrics = QtWidgets.QGridLayout()
+        metrics.setHorizontalSpacing(6)
+        metrics.setVerticalSpacing(6)
         self.phase_value = self.metric_value("待機")
         self.frame_value = self.metric_value("-")
         self.speed_value = self.metric_value("-")
@@ -125,15 +180,19 @@ class ProgressDashboard(QtWidgets.QGroupBox):
             card = QtWidgets.QFrame()
             card.setObjectName("metricCard")
             card_layout = QtWidgets.QVBoxLayout(card)
-            card_layout.setContentsMargins(7, 5, 7, 5)
+            card_layout.setContentsMargins(8, 5, 8, 5)
+            card_layout.setSpacing(0)
             key = QtWidgets.QLabel(label)
             key.setObjectName("metricKey")
             card_layout.addWidget(key)
             card_layout.addWidget(widget)
             metrics.addWidget(card, 0, col)
+            metrics.setColumnStretch(col, 1)
         layout.addLayout(metrics)
 
         form = QtWidgets.QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(2)
         self.current_video_value = self.status_value("-")
         self.detail_info_value = self.status_value("-")
         self.elapsed_value = self.status_value("-")
@@ -152,22 +211,36 @@ class ProgressDashboard(QtWidgets.QGroupBox):
             ("プロセス", self.process_value, "動画数", self.count_value),
             ("ステージ", self.stage_value, "更新", self.heartbeat_value),
             ("フェーズ経過", self.phase_elapsed_value, "残本数", self.remaining_value),
-            ("実行Dir", self.output_value, "", self.status_value("")),
         ]
         for row, (left_label, left_widget, right_label, right_widget) in enumerate(rows):
             form.addWidget(self.status_key(left_label), row, 0)
             form.addWidget(left_widget, row, 1)
             form.addWidget(self.status_key(right_label), row, 2)
             form.addWidget(right_widget, row, 3)
-        form.setColumnStretch(1, 1)
-        form.setColumnStretch(3, 2)
+        last_row = len(rows)
+        form.addWidget(self.status_key("実行Dir"), last_row, 0)
+        form.addWidget(self.output_value, last_row, 1, 1, 3)
+        form.setColumnStretch(0, 0)
+        form.setColumnStretch(1, 5)
+        form.setColumnStretch(2, 0)
+        form.setColumnStretch(3, 4)
         layout.addLayout(form)
 
         self.summary_text = QtWidgets.QPlainTextEdit()
+        self.summary_text.setObjectName("summaryText")
         self.summary_text.setReadOnly(True)
-        self.summary_text.setMaximumHeight(44)
+        self.summary_text.setMinimumHeight(38)
+        self.summary_text.setMaximumHeight(52)
         self.summary_text.setPlainText("status: idle")
+        self.summary_text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         layout.addWidget(self.summary_text)
+        layout.addStretch(0)
+
+    def _key_label(self, text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("statusKey")
+        label.setMinimumWidth(56)
+        return label
 
     def status_key(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)

@@ -8,4 +8,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 settings.local.json
-
+input/
+input_meta_debug/
+logs/

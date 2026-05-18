@@ -17,10 +17,10 @@ def windows_path_to_wsl(path: str | Path) -> str:
     if not raw:
         return raw
     raw = raw.replace("\\", "/")
-    unc_prefix = "//wsl$/"
-    if raw.lower().startswith(unc_prefix):
-        parts = raw[len(unc_prefix) :].split("/", 1)
-        return "/" + parts[1].lstrip("/") if len(parts) == 2 else "/"
+    for unc_prefix in ("//wsl$/", "//wsl.localhost/"):
+        if raw.lower().startswith(unc_prefix):
+            parts = raw[len(unc_prefix) :].split("/", 1)
+            return "/" + parts[1].lstrip("/") if len(parts) == 2 else "/"
     match = re.match(r"^([A-Za-z]):/(.*)$", raw)
     if match:
         drive = match.group(1).lower()
@@ -44,4 +44,3 @@ def wsl_path_to_unc(distro: str, path: str | Path) -> str:
 
 def normalize_windows_path(path: str | Path) -> Path:
     return Path(str(path).strip().strip('"')).expanduser()
-
