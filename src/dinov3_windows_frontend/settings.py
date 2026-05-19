@@ -24,8 +24,8 @@ SETTINGS_PATH = app_data_dir() / "settings.json"
 
 @dataclass
 class AppSettings:
-    wsl_distro: str = "Ubuntu"
-    wsl_repo_path: str = "/home/kenke/Dinov3_postprocess"
+    wsl_distro: str = "Ubuntu-test"
+    wsl_repo_path: str = "/home/kenke/workspace/Dinov3_postprocess"
     windows_output_dir: str = ""
     run_prefix: str = "ui_run"
 

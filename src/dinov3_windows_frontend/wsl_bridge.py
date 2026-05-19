@@ -60,6 +60,8 @@ class WslBridge:
             self.bash_args(script),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             **hidden_subprocess_kwargs(),
@@ -72,6 +74,8 @@ class WslBridge:
             capture_output=True,
             check=False,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             **hidden_subprocess_kwargs(),
         )
@@ -83,29 +87,33 @@ class WslBridge:
         script = r"""
 set -u
 roots=()
-[ -n "\${HOME:-}" ] && roots+=("\$HOME")
+[ -n "${HOME:-}" ] && roots+=("$HOME")
 roots+=("/home" "/mnt/c/Users")
-tmp="\${TMPDIR:-/tmp}/dinov3_frontend_candidates_\$\$"
-: > "\$tmp"
-printf '%s\n' "\$HOME/Dinov3_postprocess" >> "\$tmp"
-for root in "\${roots[@]}"; do
-  [ -d "\$root" ] || continue
-  find "\$root" -maxdepth 3 -type d -name Dinov3_postprocess -print 2>/dev/null >> "\$tmp"
+tmp="${TMPDIR:-/tmp}/dinov3_frontend_candidates_$$"
+: > "$tmp"
+printf '%s\n' "$HOME/Dinov3_postprocess" >> "$tmp"
+for root in "${roots[@]}"; do
+  [ -d "$root" ] || continue
+  find "$root" -maxdepth 3 -type d -name Dinov3_postprocess -print 2>/dev/null >> "$tmp"
 done
-sort -u "\$tmp" | while IFS= read -r dir; do
-  [ -d "\$dir" ] || continue
-  if [ -f "\$dir/.runtime/gui_runtime.env" ] && [ -f "\$dir/apps/qt_ui/run_ui_job.py" ] && [ -f "\$dir/scripts/run_integrated_pipeline.py" ]; then
-    printf 'ready\t%s\n' "\$dir"
-  elif [ -f "\$dir/apps/qt_ui/run_ui_job.py" ] && [ -f "\$dir/scripts/run_integrated_pipeline.py" ]; then
-    printf 'repo\t%s\n' "\$dir"
+sort -u "$tmp" | while IFS= read -r dir; do
+  [ -d "$dir" ] || continue
+  if [ -f "$dir/.runtime/gui_runtime.env" ] && [ -f "$dir/apps/qt_ui/run_ui_job.py" ] && [ -f "$dir/scripts/run_integrated_pipeline.py" ]; then
+    printf 'ready\t%s\n' "$dir"
+  elif [ -f "$dir/apps/qt_ui/run_ui_job.py" ] && [ -f "$dir/scripts/run_integrated_pipeline.py" ]; then
+    printf 'repo\t%s\n' "$dir"
   fi
 done
-rm -f "\$tmp"
+rm -f "$tmp"
 """
+        encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        bootstrap = f"printf %s {encoded} | base64 -d | bash"
         completed = subprocess.run(
-            ["wsl.exe", "-d", distro.strip() or "Ubuntu", "--", "bash", "-lc", script],
+            ["wsl.exe", "-d", distro.strip() or "Ubuntu", "--", "bash", "-lc", bootstrap],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             **hidden_subprocess_kwargs(),
@@ -190,18 +198,18 @@ run_ui_job|apps/qt_ui/run_ui_job.py|f
 integrated_pipeline|scripts/run_integrated_pipeline.py|f
 artifact_checker|tools/artifacts/check_artifacts.py|f
 EOF
-  if [ "\$kind" = "x" ]; then
-    [ -x "\$path" ]
-  elif [ "\$kind" = "d" ]; then
-    [ -d "\$path" ]
+  if [ "$kind" = "x" ]; then
+    [ -x "$path" ]
+  elif [ "$kind" = "d" ]; then
+    [ -d "$path" ]
   else
-    [ -f "\$path" ]
+    [ -f "$path" ]
   fi
-  code=\$?
-  if [ "\$code" -eq 0 ]; then
-    printf 'ok\t%s\t%s\n' "\$name" "\$path"
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    printf 'ok\t%s\t%s\n' "$name" "$path"
   else
-    printf 'missing\t%s\t%s\n' "\$name" "\$path"
+    printf 'missing\t%s\t%s\n' "$name" "$path"
   fi
 done
 """
@@ -235,6 +243,16 @@ done
         if artifacts.returncode != 0:
             detail = (artifacts.stdout or artifacts.stderr or detail).strip()
         add("runtime_artifacts", artifacts.returncode == 0, detail)
+
+        rtdetr_rec = runtime.profile_recommendations().get("rtdetr", {})
+        rtdetr_rec = rtdetr_rec if isinstance(rtdetr_rec, dict) else {}
+        rtdetr_repo = runtime.gui_runtime_env.get("RTDETR_REPO") or rtdetr_rec.get("repo")
+        if rtdetr_repo:
+            rtdetr_check = self.run_bash(
+                f"test -f {shlex.quote(str(rtdetr_repo).rstrip('/') + '/tools/inference/video_sqlite_inf.py')}",
+                timeout=10,
+            )
+            add("rtdetr_repo", rtdetr_check.returncode == 0, str(rtdetr_repo))
         return checks
 
     def check_artifacts_command(self, runtime: WslRuntime) -> list[str]:
@@ -261,12 +279,20 @@ done
         dinov3 = recs.get("dinov3", {}) if isinstance(recs.get("dinov3"), dict) else {}
         eva02 = recs.get("eva02", {}) if isinstance(recs.get("eva02"), dict) else {}
         codino = recs.get("codino", {}) if isinstance(recs.get("codino"), dict) else {}
+        rtdetr = recs.get("rtdetr", {}) if isinstance(recs.get("rtdetr"), dict) else {}
+        rtdetr_repo = runtime.gui_runtime_env.get("RTDETR_REPO") or rtdetr.get("repo")
+        rtdetr_status = "none"
+        if rtdetr_repo:
+            check = self.run_bash(f"test -f {shlex.quote(str(rtdetr_repo).rstrip('/') + '/tools/inference/video_sqlite_inf.py')}", timeout=10)
+            rtdetr_status = "ok" if check.returncode == 0 else "missing"
         summary = (
             f"WSL={self.distro} repo={self.repo_path} | "
             f"python={runtime.python} | "
             f"DINOv3 batch={dinov3.get('batch_size', '既定')} | "
             f"EVA02 batch={eva02.get('batch_size', '既定')} | "
-            f"Co-DINO batch={codino.get('batch_size', '既定')}"
+            f"Co-DINO batch={codino.get('batch_size', '既定')} | "
+            f"RT-DETR batch={rtdetr.get('batch_size', '既定')} | "
+            f"RT-DETR={rtdetr_status}"
         )
         return summary
 

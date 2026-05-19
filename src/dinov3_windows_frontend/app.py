@@ -13,13 +13,15 @@ from .path_utils import VIDEO_EXTS, clean_run_part, normalize_windows_path, wind
 from .process_utils import hidden_windows_process_command
 from .progress import format_duration, parse_progress_line
 from .progress_view import ProgressDashboard, phase_key, phase_label, progress_float
-from .settings import AppSettings
+from .settings import AppSettings, app_data_dir
 from .widgets import ClosingComboBox
 from .wsl_bridge import WslBridge, WslRuntime
 
 
 DEFAULT_RAW_REMOVE_SHORT_TRACKS_MAX_FRAMES = 10
 DEFAULT_OVERLAY_ENCODER = "nvenc"
+GUI_SETTINGS_PATH = Path(os.environ.get("DINOV3_WINDOWS_UI_SETTINGS_FILE", app_data_dir() / "ui_settings.json"))
+GUI_SETTINGS_VERSION = 1
 
 
 def timestamp() -> str:
@@ -62,14 +64,21 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.last_built_staging_output_root_wsl = ""
         self.last_built_staging_run_dir_wsl = ""
         self.last_built_final_run_dir_wsl = ""
+        self.loading_settings = False
 
         self.elapsed_timer = QtCore.QTimer(self)
         self.elapsed_timer.setInterval(1000)
         self.elapsed_timer.timeout.connect(self.update_elapsed)
+        self.settings_save_timer = QtCore.QTimer(self)
+        self.settings_save_timer.setInterval(500)
+        self.settings_save_timer.setSingleShot(True)
+        self.settings_save_timer.timeout.connect(self.save_user_settings)
 
         self.build_ui()
         self.apply_style()
         self.refresh_wsl_distros()
+        self.load_user_settings()
+        self.connect_settings_signals()
         self.discover_runtime(silent=True)
         self.load_runtime(silent=True)
         self.update_queue_state()
@@ -168,8 +177,10 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.detector_combo.addItem("DINOv3", "dinov3")
         self.detector_combo.addItem("EVA02", "eva02")
         self.detector_combo.addItem("Co-DINO", "codino")
+        self.detector_combo.addItem("顔・頭のみ（AIなし）", "head_face")
         self.detector_combo.setCurrentIndex(1)
         self.detector_combo.setMinimumWidth(140)
+        self.detector_combo.currentIndexChanged.connect(self.update_detector_mode)
 
         form.addWidget(self._form_label("Backend"), 0, 0)
         form.addWidget(self.detector_combo, 0, 1)
@@ -186,13 +197,20 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.detailed_overlay_check = QtWidgets.QCheckBox("詳細")
         self.detector_overlay_check = QtWidgets.QCheckBox("AI生成カバー")
         self.simple_overlay_check = QtWidgets.QCheckBox("簡易")
+        self.head_face_detect_check = QtWidgets.QCheckBox("AI検出に顔・頭検出を追加（RT-DETR）")
+        self.head_face_overlay_check = QtWidgets.QCheckBox("顔・頭検出")
+        self.head_face_overlay_check.setToolTip("顔・頭のみモードでは常に生成します。通常AI検出では任意です。")
+        self.head_face_detect_check.toggled.connect(self.update_head_face_enabled)
         self.detailed_overlay_check.setChecked(True)
         overlay_row.addWidget(overlay_label)
         overlay_row.addWidget(self.detailed_overlay_check)
         overlay_row.addWidget(self.detector_overlay_check)
         overlay_row.addWidget(self.simple_overlay_check)
+        overlay_row.addWidget(self.head_face_detect_check)
+        overlay_row.addWidget(self.head_face_overlay_check)
         overlay_row.addStretch(1)
         root.addLayout(overlay_row)
+        self.update_head_face_enabled(False)
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(8)
@@ -1070,6 +1088,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.start_button.setEnabled(bool(self.queue_paths) and not self.process_is_running())
         self.remove_button.setEnabled(bool(self.queue_paths) and not self.process_is_running())
         self.clear_button.setEnabled(bool(self.queue_paths) and not self.process_is_running())
+        self.schedule_settings_save()
 
     def check_artifacts(self) -> None:
         if self.process_is_running():
@@ -1101,6 +1120,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.settings.windows_output_dir = str(output_root)
         self.settings.run_prefix = self.run_prefix_edit.text()
         self.settings.save()
+        self.save_user_settings()
         self.run_queue = expanded_inputs
         self.current_index = -1
         self.current_summary_path = None
@@ -1118,16 +1138,49 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.summary_text.setPlainText("status: running")
         self.start_next_item()
 
+    def update_head_face_enabled(self, enabled: bool) -> None:
+        self.head_face_overlay_check.setEnabled(enabled)
+        if not enabled:
+            self.head_face_overlay_check.setChecked(False)
+
+    def head_face_only_mode(self) -> bool:
+        return str(self.detector_combo.currentData()) == "head_face"
+
+    def update_detector_mode(self) -> None:
+        if not hasattr(self, "postprocess_check"):
+            return
+        head_face_only = self.head_face_only_mode()
+        if head_face_only:
+            self.postprocess_check.setChecked(False)
+            self.head_face_detect_check.setChecked(True)
+            self.head_face_overlay_check.setChecked(True)
+            self.detector_overlay_check.setChecked(False)
+            self.detailed_overlay_check.setChecked(False)
+            self.simple_overlay_check.setChecked(False)
+        self.postprocess_check.setEnabled(not head_face_only)
+        self.head_face_detect_check.setEnabled(not head_face_only)
+        self.detector_overlay_check.setEnabled(not head_face_only)
+        self.detailed_overlay_check.setEnabled(not head_face_only and self.postprocess_check.isChecked())
+        self.simple_overlay_check.setEnabled(not head_face_only and self.postprocess_check.isChecked())
+        self.head_face_overlay_check.setEnabled(not head_face_only and self.head_face_detect_check.isChecked())
+
     def configure_progress_plan(self) -> None:
-        phases: list[tuple[str, float]] = [("normalize_input", 0.02), ("inference", 0.50), ("raw_sqlite", 0.05)]
-        if self.postprocess_check.isChecked():
+        head_face_only = self.head_face_only_mode()
+        phases: list[tuple[str, float]] = [("normalize_input", 0.02)]
+        if not head_face_only:
+            phases.extend([("inference", 0.50), ("raw_sqlite", 0.05)])
+        if self.head_face_detect_check.isChecked() or head_face_only:
+            phases.append(("head_face", 0.16))
+        if self.postprocess_check.isChecked() and not head_face_only:
             phases.append(("postprocess", 0.25))
-        if self.detector_overlay_check.isChecked():
+        if self.detector_overlay_check.isChecked() and not head_face_only:
             phases.append(("raw_overlay", 0.08))
-        if self.detailed_overlay_check.isChecked():
+        if self.detailed_overlay_check.isChecked() and not head_face_only:
             phases.append(("detailed_overlay", 0.07))
-        if self.simple_overlay_check.isChecked():
+        if self.simple_overlay_check.isChecked() and not head_face_only:
             phases.append(("simple_overlay", 0.03))
+        if head_face_only or self.head_face_overlay_check.isChecked():
+            phases.append(("head_face_overlay", 0.04))
         total = sum(weight for _, weight in phases) or 1.0
         offset = 0.0
         self.progress_phase_weights = {}
@@ -1182,9 +1235,10 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.phase_value.setText("起動中")
         self.status_value_label.setText("running")
         self.progress_dashboard.set_overall_percent(self.current_index / max(1, len(self.run_queue)) * 100.0)
+        postprocess_count = 0 if self.head_face_only_mode() else self.current_index + 1 if self.postprocess_check.isChecked() else 0
         self.count_value.setText(
             f"Inference {self.current_index + 1} / {len(self.run_queue)} | "
-            f"Postprocess {self.current_index + 1 if self.postprocess_check.isChecked() else 0} / {len(self.run_queue)}"
+            f"Postprocess {postprocess_count} / {len(self.run_queue)}"
         )
         self.remaining_value.setText(str(len(self.run_queue) - self.current_index - 1))
         self.append_log("")
@@ -1202,6 +1256,12 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             return int(value) if value is not None else None
         except Exception:
             return None
+
+    def runtime_env_value(self, key: str) -> str | None:
+        if self.runtime is None:
+            return None
+        value = self.runtime.gui_runtime_env.get(key)
+        return str(value) if value else None
 
     def profile_value(self, section: str, key: str) -> str | None:
         try:
@@ -1291,12 +1351,16 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
 
     def build_command(self, input_path: Path, index: int) -> list[str]:
         assert self.runtime is not None
-        detector = str(self.detector_combo.currentData())
+        selected_detector = str(self.detector_combo.currentData())
+        head_face_only = selected_detector == "head_face"
+        detector = "dinov3" if head_face_only else selected_detector
         final_output_root = normalize_windows_path(self.output_edit.text())
         prefix = clean_run_part(self.run_prefix_edit.text() or "ui_run")
         run_name = f"{prefix}_{timestamp()}_{index + 1:02d}_{clean_run_part(input_path.stem)}"
         self.last_built_run_name = run_name
-        postprocess = self.postprocess_check.isChecked()
+        postprocess = False if head_face_only else self.postprocess_check.isChecked()
+        head_face_enabled = head_face_only or self.head_face_detect_check.isChecked()
+        head_face_overlay = head_face_only or (head_face_enabled and self.head_face_overlay_check.isChecked())
         detailed_overlay = postprocess and self.detailed_overlay_check.isChecked()
         simple_overlay = postprocess and self.simple_overlay_check.isChecked()
         if detailed_overlay and simple_overlay:
@@ -1324,9 +1388,37 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             "--detector",
             detector,
             "--postprocess" if postprocess else "--no-postprocess",
+            "--head-face-detect" if head_face_enabled else "--no-head-face-detect",
             "--progress-interval-sec",
             "5",
         ]
+        if head_face_only:
+            pipeline_command.append("--head-face-only")
+        if head_face_enabled:
+            rtdetr_rec = self.profile_recs().get("rtdetr", {})
+            rtdetr_rec = rtdetr_rec if isinstance(rtdetr_rec, dict) else {}
+            rtdetr_repo = self.runtime_env_value("RTDETR_REPO") or self.profile_value("rtdetr", "repo")
+            if rtdetr_repo:
+                pipeline_command.extend(["--rtdetr-repo", rtdetr_repo])
+            rtdetr_batch = self.runtime_env_value("RTDETR_BATCH_SIZE") or self.profile_int("rtdetr", "batch_size")
+            if rtdetr_batch:
+                pipeline_command.extend(["--head-face-batch-size", str(rtdetr_batch)])
+            rtdetr_device = self.runtime_env_value("RTDETR_DEVICE") or rtdetr_rec.get("device")
+            if rtdetr_device:
+                pipeline_command.extend(["--head-face-device", str(rtdetr_device)])
+            rtdetr_progress_interval = self.runtime_env_value("RTDETR_PROGRESS_INTERVAL") or rtdetr_rec.get("progress_interval")
+            if rtdetr_progress_interval:
+                pipeline_command.extend(["--head-face-progress-interval", str(rtdetr_progress_interval)])
+            for option, env_key, profile_key in (
+                ("--rtdetr-config", "RTDETR_CONFIG", "config"),
+                ("--rtdetr-checkpoint", "RTDETR_CHECKPOINT", "checkpoint"),
+            ):
+                raw_path = self.runtime_env_value(env_key)
+                if not raw_path:
+                    profile_value = rtdetr_rec.get(profile_key)
+                    raw_path = str(profile_value) if profile_value else None
+                if raw_path:
+                    pipeline_command.extend([option, str(raw_path)])
         if postprocess:
             policy_path = self.write_policy_file(staging_output_unc, run_name)
             pipeline_command.extend(
@@ -1349,8 +1441,9 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             pipeline_command.append("--force")
         if self.max_frames_spin.value() > 0:
             pipeline_command.extend(["--max-frames", str(self.max_frames_spin.value())])
-        self.add_detector_options(pipeline_command, detector)
-        if self.score_enable.isChecked():
+        if not head_face_only:
+            self.add_detector_options(pipeline_command, detector)
+        if self.score_enable.isChecked() and not head_face_only:
             flag = "--eva02-score-thresh" if detector == "eva02" else "--codino-score-thresh" if detector == "codino" else "--score-thresh"
             pipeline_command.extend([flag, f"{self.score_spin.value():.3f}"])
         if postprocess:
@@ -1381,7 +1474,8 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             run_name,
             "--overlay-mode",
             overlay_mode,
-            "--raw-overlay" if self.detector_overlay_check.isChecked() else "--no-raw-overlay",
+            "--raw-overlay" if self.detector_overlay_check.isChecked() and not head_face_only else "--no-raw-overlay",
+            "--head-face-overlay" if head_face_overlay else "--no-head-face-overlay",
             "--encoder",
             DEFAULT_OVERLAY_ENCODER,
         ]
@@ -1740,6 +1834,8 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.discover_runtime_button.setEnabled(not running)
 
     def update_postprocess_enabled(self, enabled: bool) -> None:
+        if self.head_face_only_mode():
+            enabled = False
         widgets = [
             self.class_tabs,
             self.detailed_overlay_check,
@@ -1751,10 +1847,207 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         ]
         for widget in widgets:
             widget.setEnabled(enabled)
+        if self.head_face_only_mode():
+            self.update_detector_mode()
 
     def toggle_advanced(self, visible: bool) -> None:
         self.advanced_box.setVisible(visible)
         self.advanced_button.setText("詳細を閉じる" if visible else "詳細を開く")
+
+    def connect_settings_signals(self) -> None:
+        for edit in (self.output_edit, self.wsl_repo_edit, self.run_prefix_edit):
+            edit.textChanged.connect(self.schedule_settings_save)
+        for combo in (self.wsl_combo, self.detector_combo, *self.class_shape_combos.values()):
+            combo.currentIndexChanged.connect(self.schedule_settings_save)
+        for check in (
+            self.detailed_overlay_check,
+            self.detector_overlay_check,
+            self.simple_overlay_check,
+            self.head_face_detect_check,
+            self.head_face_overlay_check,
+            self.advanced_button,
+            self.force_check,
+            self.recursive_check,
+            self.raw_cut_detect_check,
+            self.score_enable,
+            self.postprocess_check,
+        ):
+            check.toggled.connect(self.schedule_settings_save)
+        for spin in (
+            self.max_frames_spin,
+            self.batch_size_spin,
+            self.warmup_spin,
+            self.score_spin,
+            *self.class_keyframe_spins.values(),
+            *self.class_recall_spins.values(),
+            *self.class_confidence_spins.values(),
+        ):
+            spin.valueChanged.connect(self.schedule_settings_save)
+
+    def schedule_settings_save(self, *_args: object) -> None:
+        if self.loading_settings:
+            return
+        self.settings_save_timer.start()
+
+    def set_combo_data(self, combo: QtWidgets.QComboBox, value: object) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def restore_queue_paths(self, values: object) -> None:
+        if not isinstance(values, list):
+            return
+        restored: list[Path] = []
+        seen: set[Path] = set()
+        for raw_value in values:
+            if not isinstance(raw_value, str):
+                continue
+            try:
+                path = normalize_windows_path(raw_value)
+            except Exception as exc:
+                self.append_log(f"[settings] skipped invalid input path {raw_value}: {exc}")
+                continue
+            if path in seen:
+                continue
+            try:
+                exists = path.exists()
+                is_file = path.is_file()
+            except OSError as exc:
+                self.append_log(f"[settings] skipped inaccessible input: {path} ({exc})")
+                continue
+            if not exists:
+                self.append_log(f"[settings] skipped missing input: {path}")
+                continue
+            if is_file and path.suffix.lower() not in VIDEO_EXTS:
+                self.append_log(f"[settings] skipped unsupported input: {path}")
+                continue
+            if not is_file and not path.is_dir():
+                self.append_log(f"[settings] skipped unsupported input: {path}")
+                continue
+            restored.append(path)
+            seen.add(path)
+        self.queue_paths = restored
+
+    def load_user_settings(self) -> None:
+        if not GUI_SETTINGS_PATH.is_file():
+            return
+        try:
+            settings = json.loads(GUI_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.append_log(f"[settings] failed to load {GUI_SETTINGS_PATH}: {exc}")
+            return
+        if not isinstance(settings, dict):
+            return
+        self.loading_settings = True
+        try:
+            if value := settings.get("output_root"):
+                self.output_edit.setText(str(value))
+            if value := settings.get("run_prefix"):
+                self.run_prefix_edit.setText(str(value))
+            if value := settings.get("wsl_distro"):
+                index = self.wsl_combo.findText(str(value))
+                if index >= 0:
+                    self.wsl_combo.setCurrentIndex(index)
+                else:
+                    self.wsl_combo.setEditText(str(value))
+            if value := settings.get("wsl_repo"):
+                self.wsl_repo_edit.setText(str(value))
+            self.set_combo_data(self.detector_combo, settings.get("detector"))
+
+            overlays = settings.get("overlays") if isinstance(settings.get("overlays"), dict) else {}
+            self.detailed_overlay_check.setChecked(bool(overlays.get("detailed", self.detailed_overlay_check.isChecked())))
+            self.detector_overlay_check.setChecked(bool(overlays.get("raw", self.detector_overlay_check.isChecked())))
+            self.simple_overlay_check.setChecked(bool(overlays.get("simple", self.simple_overlay_check.isChecked())))
+            self.head_face_overlay_check.setChecked(
+                bool(overlays.get("head_face", self.head_face_overlay_check.isChecked()))
+            )
+            self.head_face_detect_check.setChecked(bool(settings.get("head_face_detect", self.head_face_detect_check.isChecked())))
+            self.postprocess_check.setChecked(bool(settings.get("postprocess", self.postprocess_check.isChecked())))
+
+            advanced = settings.get("advanced") if isinstance(settings.get("advanced"), dict) else {}
+            self.advanced_button.setChecked(bool(advanced.get("expanded", self.advanced_button.isChecked())))
+            self.force_check.setChecked(bool(advanced.get("force", self.force_check.isChecked())))
+            self.recursive_check.setChecked(bool(advanced.get("recursive", self.recursive_check.isChecked())))
+            self.raw_cut_detect_check.setChecked(bool(advanced.get("raw_cut_detect", self.raw_cut_detect_check.isChecked())))
+            self.max_frames_spin.setValue(int(advanced.get("max_frames", self.max_frames_spin.value())))
+            self.batch_size_spin.setValue(int(advanced.get("batch_size", self.batch_size_spin.value())))
+            self.warmup_spin.setValue(int(advanced.get("warmup", self.warmup_spin.value())))
+            self.score_enable.setChecked(bool(advanced.get("score_enabled", self.score_enable.isChecked())))
+            self.score_spin.setValue(float(advanced.get("score_threshold", self.score_spin.value())))
+            self.score_spin.setEnabled(self.score_enable.isChecked())
+
+            class_settings = settings.get("classes") if isinstance(settings.get("classes"), dict) else {}
+            for name, values in class_settings.items():
+                if not isinstance(values, dict):
+                    continue
+                if name in self.class_shape_combos:
+                    self.set_combo_data(self.class_shape_combos[name], values.get("shape_mode"))
+                if name in self.class_keyframe_spins and values.get("target_interval") is not None:
+                    self.class_keyframe_spins[name].setValue(int(values["target_interval"]))
+                if name in self.class_recall_spins and values.get("recall") is not None:
+                    self.class_recall_spins[name].setValue(float(values["recall"]))
+                if name in self.class_confidence_spins and values.get("confidence") is not None:
+                    self.class_confidence_spins[name].setValue(float(values["confidence"]))
+            self.restore_queue_paths(settings.get("queue_paths"))
+        except Exception as exc:
+            self.append_log(f"[settings] failed to apply {GUI_SETTINGS_PATH}: {exc}")
+        finally:
+            self.loading_settings = False
+        self.toggle_advanced(self.advanced_button.isChecked())
+        self.update_head_face_enabled(self.head_face_detect_check.isChecked())
+        self.update_detector_mode()
+        self.update_postprocess_enabled(self.postprocess_check.isChecked())
+
+    def user_settings(self) -> dict[str, object]:
+        return {
+            "version": GUI_SETTINGS_VERSION,
+            "output_root": self.output_edit.text().strip(),
+            "run_prefix": self.run_prefix_edit.text().strip(),
+            "queue_paths": [str(path) for path in self.queue_paths],
+            "wsl_distro": self.wsl_combo.currentText().strip(),
+            "wsl_repo": self.wsl_repo_edit.text().strip(),
+            "detector": str(self.detector_combo.currentData()),
+            "postprocess": bool(self.postprocess_check.isChecked()),
+            "head_face_detect": bool(self.head_face_detect_check.isChecked()),
+            "overlays": {
+                "detailed": bool(self.detailed_overlay_check.isChecked()),
+                "raw": bool(self.detector_overlay_check.isChecked()),
+                "simple": bool(self.simple_overlay_check.isChecked()),
+                "head_face": bool(self.head_face_overlay_check.isChecked()),
+            },
+            "advanced": {
+                "expanded": bool(self.advanced_button.isChecked()),
+                "force": bool(self.force_check.isChecked()),
+                "recursive": bool(self.recursive_check.isChecked()),
+                "raw_cut_detect": bool(self.raw_cut_detect_check.isChecked()),
+                "max_frames": int(self.max_frames_spin.value()),
+                "batch_size": int(self.batch_size_spin.value()),
+                "warmup": int(self.warmup_spin.value()),
+                "score_enabled": bool(self.score_enable.isChecked()),
+                "score_threshold": float(self.score_spin.value()),
+            },
+            "classes": {
+                name: {
+                    "shape_mode": str(self.class_shape_combos[name].currentData()),
+                    "target_interval": int(self.class_keyframe_spins[name].value()),
+                    "recall": float(self.class_recall_spins[name].value()),
+                    "confidence": float(self.class_confidence_spins[name].value()),
+                }
+                for name in self.class_shape_combos
+            },
+        }
+
+    def save_user_settings(self) -> None:
+        if self.loading_settings:
+            return
+        try:
+            GUI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            GUI_SETTINGS_PATH.write_text(
+                json.dumps(self.user_settings(), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.append_log(f"[settings] failed to save {GUI_SETTINGS_PATH}: {exc}")
 
     def append_log(self, text: str) -> None:
         self.log_edit.appendPlainText(text)
@@ -1767,6 +2060,8 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.elapsed_value.setText(f"{elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.settings_save_timer.stop()
+        self.save_user_settings()
         if self.process_is_running():
             self.stop_process()
         event.accept()
