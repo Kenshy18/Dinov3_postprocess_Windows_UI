@@ -11,3 +11,4 @@ settings.local.json
 input/
 input_meta_debug/
 logs/
+runtime_manifests/
