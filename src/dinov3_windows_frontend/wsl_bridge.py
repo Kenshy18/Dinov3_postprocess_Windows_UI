@@ -6,7 +6,6 @@ import os
 import shlex
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 from .path_utils import wsl_path_to_unc
 
@@ -30,9 +29,47 @@ class WslRuntime:
     gui_runtime_env: dict[str, str]
     runtime_profile: dict
 
+    def repo_path_value(self, value: str | os.PathLike[str]) -> str:
+        raw = str(value)
+        if raw.startswith("/"):
+            return raw
+        return f"{self.repo_path.rstrip('/')}/{raw.lstrip('/')}"
+
     @property
     def python(self) -> str:
-        return self.gui_runtime_env.get("GUI_RUNTIME_PYTHON") or str(Path(self.repo_path) / ".venv_integrated/bin/python")
+        runtime_section = self.runtime_profile.get("runtime", {})
+        candidates = [
+            self.gui_runtime_env.get("GUI_RUNTIME_PYTHON"),
+            runtime_section.get("python") if isinstance(runtime_section, dict) else None,
+            self.runtime_profile.get("python"),
+            f"{self.repo_path.rstrip('/')}/.venv_integrated/bin/python",
+        ]
+        for value in candidates:
+            if value:
+                return self.repo_path_value(str(value))
+        return "python3"
+
+    def detector_python(self, detector: str) -> str | None:
+        key = {
+            "dinov3": "DINOV3_DETECTOR_PYTHON",
+            "eva02": "EVA02_DETECTOR_PYTHON",
+        }.get(detector)
+        if not key:
+            return None
+        value = self.gui_runtime_env.get(key)
+        return self.repo_path_value(value) if value else None
+
+    def dinov3_trt_backbone_engine(self) -> str | None:
+        value = self.gui_runtime_env.get("DINOV3_TRT_BACKBONE_ENGINE")
+        if value:
+            return self.repo_path_value(value)
+        rec = self.profile_recommendations().get("dinov3", {})
+        if isinstance(rec, dict) and rec.get("trt_backbone_engine"):
+            return self.repo_path_value(str(rec["trt_backbone_engine"]))
+        return None
+
+    def eva02_compile_backbone(self) -> str:
+        return self.gui_runtime_env.get("EVA02_COMPILE_BACKBONE") or "none"
 
     def profile_recommendations(self) -> dict:
         recs = self.runtime_profile.get("recommendations", {})
@@ -136,6 +173,18 @@ rm -f "$tmp"
     def quote_command(self, command: list[str]) -> str:
         return " ".join(shlex.quote(part) for part in command)
 
+    def runtime_env_prefix(self) -> str:
+        return (
+            "set -euo pipefail; "
+            "set -a; source .runtime/gui_runtime.env; set +a; "
+            "if [ -x .runtime/mamba_py311/bin/x86_64-conda-linux-gnu-gcc ]; then "
+            "export CC=${CC:-$PWD/.runtime/mamba_py311/bin/x86_64-conda-linux-gnu-gcc}; "
+            "fi; "
+            "if [ -x .runtime/mamba_py311/bin/x86_64-conda-linux-gnu-g++ ]; then "
+            "export CXX=${CXX:-$PWD/.runtime/mamba_py311/bin/x86_64-conda-linux-gnu-g++}; "
+            "fi; "
+        )
+
     def parse_env(self, text: str) -> dict[str, str]:
         values: dict[str, str] = {}
         for raw_line in text.splitlines():
@@ -235,6 +284,17 @@ done
             detail = f"{runtime.python} {(py_check.stdout or py_check.stderr).strip()}"
         add("runtime_python_imports", py_check.returncode == 0, detail)
 
+        detector_import_check = "import importlib.util as u; missing=[m for m in ['torch'] if u.find_spec(m) is None]; print('missing=' + ','.join(missing)); raise SystemExit(1 if missing else 0)"
+        for detector_name in ("dinov3", "eva02"):
+            detector_python = runtime.detector_python(detector_name)
+            if not detector_python:
+                continue
+            detector_check = self.run_bash(self.quote_command([detector_python, "-c", detector_import_check]), timeout=20)
+            detector_detail = detector_python
+            if detector_check.returncode != 0:
+                detector_detail = f"{detector_python} {(detector_check.stdout or detector_check.stderr).strip()}"
+            add(f"{detector_name}_detector_python", detector_check.returncode == 0, detector_detail)
+
         artifacts = self.run_bash(
             "source .runtime/gui_runtime.env; " + self.quote_command([runtime.python, "tools/artifacts/check_artifacts.py", "--require-trt"]),
             timeout=60,
@@ -261,14 +321,14 @@ done
             "tools/artifacts/check_artifacts.py",
             "--require-trt",
         ]
-        return self.bash_args("set -euo pipefail; source .runtime/gui_runtime.env; " + self.quote_command(inner))
+        return self.bash_args(self.runtime_env_prefix() + self.quote_command(inner))
 
     def job_command(self, inner_command: list[str]) -> list[str]:
-        script = "set -euo pipefail; source .runtime/gui_runtime.env; " + self.quote_command(inner_command)
+        script = self.runtime_env_prefix() + self.quote_command(inner_command)
         return self.bash_args(script)
 
     def job_script_command(self, script: str) -> list[str]:
-        return self.bash_args("set -euo pipefail; source .runtime/gui_runtime.env; " + script)
+        return self.bash_args(self.runtime_env_prefix() + script)
 
     def setup_summary(self) -> str:
         try:
@@ -278,7 +338,6 @@ done
         recs = runtime.profile_recommendations()
         dinov3 = recs.get("dinov3", {}) if isinstance(recs.get("dinov3"), dict) else {}
         eva02 = recs.get("eva02", {}) if isinstance(recs.get("eva02"), dict) else {}
-        codino = recs.get("codino", {}) if isinstance(recs.get("codino"), dict) else {}
         rtdetr = recs.get("rtdetr", {}) if isinstance(recs.get("rtdetr"), dict) else {}
         rtdetr_repo = runtime.gui_runtime_env.get("RTDETR_REPO") or rtdetr.get("repo")
         rtdetr_status = "none"
@@ -288,9 +347,10 @@ done
         summary = (
             f"WSL={self.distro} repo={self.repo_path} | "
             f"python={runtime.python} | "
+            f"DINOv3 py={runtime.detector_python('dinov3') or 'shared'} | "
+            f"EVA02 py={runtime.detector_python('eva02') or 'shared'} | "
             f"DINOv3 batch={dinov3.get('batch_size', '既定')} | "
             f"EVA02 batch={eva02.get('batch_size', '既定')} | "
-            f"Co-DINO batch={codino.get('batch_size', '既定')} | "
             f"RT-DETR batch={rtdetr.get('batch_size', '既定')} | "
             f"RT-DETR={rtdetr_status}"
         )

@@ -7,7 +7,7 @@ import unittest
 from dinov3_windows_frontend.path_utils import clean_run_part, windows_path_to_wsl, wsl_path_to_unc
 from dinov3_windows_frontend.process_utils import hidden_windows_process_command
 from dinov3_windows_frontend.progress import parse_progress_line
-from dinov3_windows_frontend.wsl_bridge import WslBridge
+from dinov3_windows_frontend.wsl_bridge import WslBridge, WslRuntime
 
 
 class PathUtilsTests(unittest.TestCase):
@@ -61,6 +61,27 @@ class WslBridgeTests(unittest.TestCase):
         decoded = self.decoded_bash_script(command)
         self.assertIn("source .runtime/gui_runtime.env", decoded)
         self.assertIn("echo ok", decoded)
+
+    def test_runtime_uses_individual_detector_python_and_env_engine(self) -> None:
+        runtime = WslRuntime(
+            distro="Ubuntu",
+            repo_path="/repo",
+            gui_runtime_env={
+                "DINOV3_DETECTOR_PYTHON": "/dinov3/bin/python",
+                "EVA02_DETECTOR_PYTHON": "eva/bin/python",
+                "DINOV3_TRT_BACKBONE_ENGINE": "/engines/dinov3.engine",
+                "EVA02_COMPILE_BACKBONE": "none",
+            },
+            runtime_profile={
+                "runtime": {"python": "/repo/.venv/bin/python"},
+                "recommendations": {"dinov3": {"trt_backbone_engine": "/profile/dinov3.engine"}},
+            },
+        )
+        self.assertEqual(runtime.python, "/repo/.venv/bin/python")
+        self.assertEqual(runtime.detector_python("dinov3"), "/dinov3/bin/python")
+        self.assertEqual(runtime.detector_python("eva02"), "/repo/eva/bin/python")
+        self.assertEqual(runtime.dinov3_trt_backbone_engine(), "/engines/dinov3.engine")
+        self.assertEqual(runtime.eva02_compile_backbone(), "none")
 
 
 class ProgressTests(unittest.TestCase):

@@ -46,7 +46,15 @@ The app also tries to discover `Dinov3_postprocess` under the installed WSL
 distros on startup. Use **自動探索** to rerun discovery manually, then use
 **接続確認** before running jobs. The connection check validates `wsl.exe`, the
 WSL repository, `.runtime/gui_runtime.env`, runtime profile, WSL-side UI job
-scripts, runtime Python imports, runtime artifacts, and TensorRT artifacts.
+scripts, runtime Python imports, optional DINOv3/EVA02 detector Python
+environments, runtime artifacts, and TensorRT artifacts.
+
+The detector selector exposes `DINOv3`, `EVA02`, and `顔・頭のみ（AIなし）`.
+If `.runtime/gui_runtime.env` defines `DINOV3_DETECTOR_PYTHON` or
+`EVA02_DETECTOR_PYTHON`, the Windows frontend passes them through to
+`scripts/run_integrated_pipeline.py` as `--dinov3-python` / `--eva02-python`.
+`EVA02_COMPILE_BACKBONE` is also forwarded, and `DINOV3_TRT_BACKBONE_ENGINE`
+takes precedence over the profile recommendation for DINOv3.
 
 ## Build EXE
 
@@ -54,7 +62,7 @@ scripts, runtime Python imports, runtime artifacts, and TensorRT artifacts.
 .\scripts\build_exe.ps1
 ```
 
-The executable is written under `dist\Dinov3PostprocessFrontend`.
+The one-file GUI executable is written to `dist\Dinov3PostprocessFrontend.exe`.
 
 ## Generate Codec/Meta Debug Inputs
 

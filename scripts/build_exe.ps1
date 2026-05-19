@@ -52,8 +52,9 @@ $env:PYTHONPATH = Join-Path $Root "src"
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
+    --onefile `
     --windowed `
     --name Dinov3PostprocessFrontend `
     --paths (Join-Path $Root "src") `
     (Join-Path $Root "src\dinov3_windows_frontend\__main__.py")
-Write-Host "Built: $(Join-Path $Root 'dist\Dinov3PostprocessFrontend')"
+Write-Host "Built: $(Join-Path $Root 'dist\Dinov3PostprocessFrontend.exe')"

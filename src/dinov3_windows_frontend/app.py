@@ -176,7 +176,6 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.detector_combo = ClosingComboBox()
         self.detector_combo.addItem("DINOv3", "dinov3")
         self.detector_combo.addItem("EVA02", "eva02")
-        self.detector_combo.addItem("Co-DINO", "codino")
         self.detector_combo.addItem("顔・頭のみ（AIなし）", "head_face")
         self.detector_combo.setCurrentIndex(1)
         self.detector_combo.setMinimumWidth(140)
@@ -1263,6 +1262,11 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         value = self.runtime.gui_runtime_env.get(key)
         return str(value) if value else None
 
+    def detector_python(self, detector: str) -> str | None:
+        if self.runtime is None:
+            return None
+        return self.runtime.detector_python(detector)
+
     def profile_value(self, section: str, key: str) -> str | None:
         try:
             value = self.profile_recs().get(section, {}).get(key)
@@ -1352,6 +1356,8 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
     def build_command(self, input_path: Path, index: int) -> list[str]:
         assert self.runtime is not None
         selected_detector = str(self.detector_combo.currentData())
+        if selected_detector not in {"dinov3", "eva02", "head_face"}:
+            selected_detector = "eva02"
         head_face_only = selected_detector == "head_face"
         detector = "dinov3" if head_face_only else selected_detector
         final_output_root = normalize_windows_path(self.output_edit.text())
@@ -1444,7 +1450,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         if not head_face_only:
             self.add_detector_options(pipeline_command, detector)
         if self.score_enable.isChecked() and not head_face_only:
-            flag = "--eva02-score-thresh" if detector == "eva02" else "--codino-score-thresh" if detector == "codino" else "--score-thresh"
+            flag = "--eva02-score-thresh" if detector == "eva02" else "--score-thresh"
             pipeline_command.extend([flag, f"{self.score_spin.value():.3f}"])
         if postprocess:
             fallback_recall = max(self.class_recall_values()) if self.class_recall_values() else 0.960
@@ -1494,36 +1500,27 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
 
     def add_detector_options(self, command: list[str], detector: str) -> None:
         if detector == "eva02":
+            eva02_python = self.detector_python("eva02")
+            eva02_compile_backbone = self.runtime.eva02_compile_backbone() if self.runtime is not None else "none"
             batch = self.batch_size_spin.value() if self.batch_size_spin.value() > 0 else self.profile_int("eva02", "batch_size")
             warmup = self.warmup_spin.value() if self.warmup_spin.value() >= 0 else self.profile_int("eva02", "warmup_frames")
             classifier_batch = self.profile_int("eva02", "classifier_batch_size")
+            if eva02_python:
+                command.extend(["--eva02-python", eva02_python])
+            command.extend(["--eva02-compile-backbone", eva02_compile_backbone])
             if batch:
                 command.extend(["--eva02-batch-size", str(batch)])
             if warmup is not None:
                 command.extend(["--eva02-warmup-frames", str(warmup)])
             if classifier_batch:
                 command.extend(["--eva02-classifier-batch-size", str(classifier_batch)])
-        elif detector == "codino":
-            batch = self.batch_size_spin.value() if self.batch_size_spin.value() > 0 else self.profile_int("codino", "batch_size")
-            warmup = self.warmup_spin.value() if self.warmup_spin.value() >= 0 else self.profile_int("codino", "warmup_frames")
-            if batch:
-                command.extend(["--codino-batch-size", str(batch)])
-            if warmup is not None:
-                command.extend(["--codino-warmup-frames", str(warmup)])
-            for key, flag in (
-                ("trt_backbone_engine", "--codino-trt-backbone-engine"),
-                ("trt_feature_engine", "--codino-trt-feature-engine"),
-                ("trt_query_encoder_engine", "--codino-trt-query-encoder-engine"),
-                ("trt_decoder_engine", "--codino-trt-decoder-engine"),
-                ("trt_mask_head_engine", "--codino-trt-mask-head-engine"),
-            ):
-                value = self.profile_value("codino", key)
-                if value:
-                    command.extend([flag, value])
         else:
+            dinov3_python = self.detector_python("dinov3")
             batch = self.batch_size_spin.value() if self.batch_size_spin.value() > 0 else self.profile_int("dinov3", "batch_size")
             warmup = self.warmup_spin.value() if self.warmup_spin.value() >= 0 else self.profile_int("dinov3", "warmup_frames")
-            engine = self.profile_value("dinov3", "trt_backbone_engine")
+            engine = self.runtime.dinov3_trt_backbone_engine() if self.runtime is not None else self.profile_value("dinov3", "trt_backbone_engine")
+            if dinov3_python:
+                command.extend(["--dinov3-python", dinov3_python])
             if batch:
                 command.extend(["--batch-size", str(batch)])
             if warmup is not None:

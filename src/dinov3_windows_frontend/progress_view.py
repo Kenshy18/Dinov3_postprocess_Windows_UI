@@ -87,7 +87,7 @@ def phase_key(value: str | None) -> str:
         return "raw_sqlite"
     if "postprocess" in normalized or "atosyori" in normalized:
         return "postprocess"
-    if any(token in normalized for token in ("inference", "infer", "detect", "detector", "codino", "dinov3", "eva02")):
+    if any(token in normalized for token in ("inference", "infer", "detect", "detector", "dinov3", "eva02")):
         return "inference"
     if "command" in normalized:
         return "command"
