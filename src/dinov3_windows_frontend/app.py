@@ -1222,6 +1222,10 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             return
         path = self.run_queue[self.current_index]
         self.active_progress_phase_key = ""
+        self.last_built_run_name = ""
+        self.last_built_staging_output_root_wsl = ""
+        self.last_built_staging_run_dir_wsl = ""
+        self.last_built_final_run_dir_wsl = ""
         output_root = normalize_windows_path(self.output_edit.text())
         try:
             mount_results = self.current_bridge().ensure_drvfs_mounts([path, output_root])
