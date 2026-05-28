@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.last_built_staging_output_root_wsl = ""
         self.last_built_staging_run_dir_wsl = ""
         self.last_built_final_run_dir_wsl = ""
+        self.failed_runs: list[dict[str, object]] = []
         self.loading_settings = False
 
         self.elapsed_timer = QtCore.QTimer(self)
@@ -1125,6 +1127,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.current_summary_path = None
         self.stopping = False
         self.workflow_running = True
+        self.failed_runs = []
         self.queue_start_time = time.perf_counter()
         self.active_progress_phase_key = ""
         self.last_overall_percent = 0.0
@@ -1224,23 +1227,38 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             mount_results = self.current_bridge().ensure_drvfs_mounts([path, output_root])
         except (OSError, RuntimeError, ValueError) as exc:
             self.append_log(f"[error] failed to prepare WSL drive mounts: {exc}")
-            self.report_local_error("WSLドライブをマウントできません", str(exc), finish_workflow=True)
+            self.current_run_name = f"failed_{timestamp()}_{self.current_index + 1:02d}_{clean_run_part(path.stem)}"
+            self.current_summary_path = output_root / self.current_run_name / "summary.json"
+            logs_dir = self.save_failed_run_diagnostics(path=path, exit_code=-1, reason=f"mount preparation failed: {exc}")
+            if logs_dir is not None:
+                self.append_log(f"[failed-run-log] {logs_dir}")
+            self.start_next_item()
             return
         for drive, ok, detail in mount_results:
             prefix = "[mount]" if ok else "[mount-error]"
             self.append_log(f"{prefix} {drive.upper()}: {detail}")
             if not ok:
-                self.report_local_error(
-                    "WSLドライブをマウントできません",
-                    f"{drive.upper()}: {detail or 'mount failed'}",
-                    finish_workflow=True,
+                self.current_run_name = f"failed_{timestamp()}_{self.current_index + 1:02d}_{clean_run_part(path.stem)}"
+                self.current_summary_path = output_root / self.current_run_name / "summary.json"
+                logs_dir = self.save_failed_run_diagnostics(
+                    path=path,
+                    exit_code=-1,
+                    reason=f"mount failed: {drive.upper()}: {detail or 'mount failed'}",
                 )
+                if logs_dir is not None:
+                    self.append_log(f"[failed-run-log] {logs_dir}")
+                self.start_next_item()
                 return
         try:
             command = self.build_command(path, self.current_index)
         except (OSError, RuntimeError, ValueError) as exc:
             self.append_log(f"[error] failed to prepare job: {exc}")
-            self.report_local_error("ジョブを開始できません", str(exc), finish_workflow=True)
+            self.current_run_name = f"failed_{timestamp()}_{self.current_index + 1:02d}_{clean_run_part(path.stem)}"
+            self.current_summary_path = output_root / self.current_run_name / "summary.json"
+            logs_dir = self.save_failed_run_diagnostics(path=path, exit_code=-1, reason=f"job preparation failed: {exc}")
+            if logs_dir is not None:
+                self.append_log(f"[failed-run-log] {logs_dir}")
+            self.start_next_item()
             return
         self.current_run_name = self.extract_run_name(command)
         self.current_summary_path = output_root / self.current_run_name / "summary.json"
@@ -1259,6 +1277,66 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.append_log("")
         self.append_log(f"[queue] {self.current_index + 1}/{len(self.run_queue)} {path}")
         self.start_process(command, label=path.name, tool_only=False)
+
+    def record_failed_run(self, *, path: Path | None, run_name: str, exit_code: int, reason: str, final_dir: Path | None) -> None:
+        item = self.current_index + 1 if self.current_index >= 0 else None
+        record: dict[str, object] = {
+            "item": item,
+            "total": len(self.run_queue),
+            "input": "" if path is None else str(path),
+            "run_name": run_name,
+            "exit_code": exit_code,
+            "reason": reason,
+            "staging_run_dir_wsl": self.last_built_staging_run_dir_wsl,
+            "final_dir": "" if final_dir is None else str(final_dir),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.failed_runs.append(record)
+
+    def save_failed_run_diagnostics(self, *, path: Path | None, exit_code: int, reason: str) -> Path | None:
+        final_dir = self.current_summary_path.parent if self.current_summary_path is not None else None
+        if final_dir is None and self.last_built_final_run_dir_wsl:
+            try:
+                final_dir = Path(wsl_path_to_unc(self.bridge.distro, self.last_built_final_run_dir_wsl))
+            except Exception:
+                final_dir = None
+        self.record_failed_run(
+            path=path,
+            run_name=self.current_run_name or self.last_built_run_name,
+            exit_code=exit_code,
+            reason=reason,
+            final_dir=final_dir,
+        )
+        if final_dir is None:
+            return None
+        logs_dir = final_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        if self.last_built_staging_run_dir_wsl:
+            try:
+                staging_run_dir = Path(wsl_path_to_unc(self.bridge.distro, self.last_built_staging_run_dir_wsl))
+                staging_logs = staging_run_dir / "logs"
+                if staging_logs.is_dir():
+                    for source in staging_logs.iterdir():
+                        if source.is_file() and source.suffix.lower() in {".log", ".jsonl", ".json", ".txt"}:
+                            shutil.copy2(source, logs_dir / source.name)
+                for name in ("summary.json", "index.json"):
+                    source = staging_run_dir / name
+                    if source.is_file():
+                        shutil.copy2(source, logs_dir / name)
+            except OSError as exc:
+                self.append_log(f"[warning] failed to copy failed-run diagnostics: {exc}")
+        failure_summary = {
+            "status": "error",
+            "input": "" if path is None else str(path),
+            "run_name": self.current_run_name or self.last_built_run_name,
+            "exit_code": exit_code,
+            "reason": reason,
+            "staging_run_dir_wsl": self.last_built_staging_run_dir_wsl,
+            "final_dir": str(final_dir),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        (logs_dir / "failed_run.json").write_text(json.dumps(failure_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return logs_dir
 
     def profile_recs(self) -> dict:
         if self.runtime is None:
@@ -1308,6 +1386,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         run_name: str,
         final_root: str,
         final_run_windows: Path,
+        source_stem: str,
     ) -> str:
         staging_run_dir = f"{staging_root.rstrip('/')}/{run_name}"
         final_run_dir = f"{final_root.rstrip('/')}/{run_name}"
@@ -1320,12 +1399,29 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             "import os\n"
             "root = Path(os.environ['CODX_FINAL_RUN'])\n"
             "final_win = (os.environ.get('CODX_FINAL_WIN') or os.environ['CODX_FINAL_RUN']).replace(chr(92), '/')\n"
+            "source_stem = os.environ.get('CODX_SOURCE_STEM', '').strip()\n"
             "parent_win = str(PureWindowsPath(final_win).parent).replace(chr(92), '/')\n"
             "pairs = [\n"
             "    (os.environ['CODX_STAGING_RUN'], final_win),\n"
             "    (os.environ['CODX_STAGING_ROOT'], parent_win),\n"
             "    (os.environ['CODX_FINAL_RUN'], final_win),\n"
             "]\n"
+            "if source_stem:\n"
+            "    for path in sorted(root.rglob('*')):\n"
+            "        if not path.is_file() or path.suffix.lower() not in {'.mp4', '.sqlite'}:\n"
+            "            continue\n"
+            "        if path.name.startswith(source_stem + '_'):\n"
+            "            continue\n"
+            "        new_path = path.with_name(source_stem + '_' + path.name)\n"
+            "        counter = 2\n"
+            "        while new_path.exists():\n"
+            "            new_path = path.with_name(source_stem + '_' + path.stem + '_' + str(counter) + path.suffix)\n"
+            "            counter += 1\n"
+            "        old_rel = path.relative_to(root).as_posix()\n"
+            "        new_rel = new_path.relative_to(root).as_posix()\n"
+            "        path.rename(new_path)\n"
+            "        pairs.append((str(path), str(new_path)))\n"
+            "        pairs.append((final_win.rstrip('/') + '/' + old_rel, final_win.rstrip('/') + '/' + new_rel))\n"
             "suffixes = {'.json', '.jsonl', '.txt', '.log', '.md', '.csv'}\n"
             "for path in root.rglob('*'):\n"
             "    if not path.is_file() or path.suffix.lower() not in suffixes:\n"
@@ -1361,7 +1457,8 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
                 f"CODX_STAGING_ROOT={self.quote_wsl(staging_root)} "
                 f"CODX_STAGING_RUN={self.quote_wsl(staging_run_dir)} "
                 f"CODX_FINAL_RUN={self.quote_wsl(final_run_dir)} "
-                f"CODX_FINAL_WIN={self.quote_wsl(final_run_windows_text)}",
+                f"CODX_FINAL_WIN={self.quote_wsl(final_run_windows_text)} "
+                f"CODX_SOURCE_STEM={self.quote_wsl(source_stem)}",
                 f"{self.quote_wsl(self.runtime.python if self.runtime else 'python3')} -c {self.quote_wsl(rewrite_code)}",
                 f"rm -rf {self.quote_wsl(staging_root)}",
                 f"echo {self.quote_wsl('[windows-output] ' + final_run_windows_text)}",
@@ -1511,6 +1608,7 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             run_name=run_name,
             final_root=final_output_wsl,
             final_run_windows=final_output_root / run_name,
+            source_stem=input_path.stem,
         )
         return self.bridge.job_script_command(script)
 
@@ -1782,6 +1880,17 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             self.status_value_label.setText("completed")
             self.start_next_item()
             return
+        if self.workflow_running and not self.stopping:
+            path = self.run_queue[self.current_index] if 0 <= self.current_index < len(self.run_queue) else None
+            logs_dir = self.save_failed_run_diagnostics(path=path, exit_code=exit_code, reason=f"process exited with {exit_code}")
+            if logs_dir is not None:
+                self.append_log(f"[failed-run-log] {logs_dir}")
+            self.append_log("[queue] failed item recorded; continuing with next input")
+            item_done = (self.current_index + 1) / max(1, len(self.run_queue)) * 100.0
+            self.last_overall_percent = max(self.last_overall_percent, item_done)
+            self.progress_dashboard.set_overall_percent(item_done)
+            self.start_next_item()
+            return
         self.finish_queue(success=False, exit_code=exit_code)
 
     def process_error(self, error: QtCore.QProcess.ProcessError) -> None:
@@ -1804,11 +1913,23 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
         self.update_running_state(False)
         self.process_value.setText("NotRunning")
         if success:
-            self.status_banner.setText("完了")
+            failed_count = len(self.failed_runs)
+            self.status_banner.setText("completed with errors" if failed_count else "完了")
             self.phase_value.setText("完了")
             self.progress_dashboard.set_overall_percent(100.0)
-            self.status_value_label.setText("completed")
-            self.summary_text.setPlainText("status: completed\nqueue: done")
+            self.status_value_label.setText("completed with errors" if failed_count else "completed")
+            if failed_count:
+                failed_lines = [
+                    f"{item.get('item')}/{item.get('total')} {item.get('input')} -> {item.get('final_dir')}"
+                    for item in self.failed_runs
+                ]
+                self.summary_text.setPlainText(
+                    "status: completed_with_errors\n"
+                    f"failed: {failed_count}\n"
+                    + "\n".join(failed_lines[:20])
+                )
+            else:
+                self.summary_text.setPlainText("status: completed\nqueue: done")
         else:
             self.status_banner.setText("停止" if self.stopping else "エラー")
             self.status_value_label.setText("stopped" if self.stopping else f"exit {exit_code}")
