@@ -1219,6 +1219,23 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             return
         path = self.run_queue[self.current_index]
         self.active_progress_phase_key = ""
+        output_root = normalize_windows_path(self.output_edit.text())
+        try:
+            mount_results = self.current_bridge().ensure_drvfs_mounts([path, output_root])
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.append_log(f"[error] failed to prepare WSL drive mounts: {exc}")
+            self.report_local_error("WSLドライブをマウントできません", str(exc), finish_workflow=True)
+            return
+        for drive, ok, detail in mount_results:
+            prefix = "[mount]" if ok else "[mount-error]"
+            self.append_log(f"{prefix} {drive.upper()}: {detail}")
+            if not ok:
+                self.report_local_error(
+                    "WSLドライブをマウントできません",
+                    f"{drive.upper()}: {detail or 'mount failed'}",
+                    finish_workflow=True,
+                )
+                return
         try:
             command = self.build_command(path, self.current_index)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1226,7 +1243,6 @@ class PipelineUiWindow(QtWidgets.QMainWindow):
             self.report_local_error("ジョブを開始できません", str(exc), finish_workflow=True)
             return
         self.current_run_name = self.extract_run_name(command)
-        output_root = normalize_windows_path(self.output_edit.text())
         self.current_summary_path = output_root / self.current_run_name / "summary.json"
         self.current_video_value.setText(path.name)
         self.output_value.setText(str(self.current_summary_path.parent))

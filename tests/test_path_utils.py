@@ -4,7 +4,7 @@ import base64
 import os
 import unittest
 
-from dinov3_windows_frontend.path_utils import clean_run_part, windows_path_to_wsl, wsl_path_to_unc
+from dinov3_windows_frontend.path_utils import clean_run_part, windows_drive_letter, windows_path_to_wsl, wsl_path_to_unc
 from dinov3_windows_frontend.process_utils import hidden_windows_process_command
 from dinov3_windows_frontend.progress import parse_progress_line
 from dinov3_windows_frontend.wsl_bridge import WslBridge, WslRuntime
@@ -16,6 +16,11 @@ class PathUtilsTests(unittest.TestCase):
             windows_path_to_wsl(r"C:\Users\alice\Videos\a file.mp4"),
             "/mnt/c/Users/alice/Videos/a file.mp4",
         )
+
+    def test_windows_drive_letter(self) -> None:
+        self.assertEqual(windows_drive_letter(r"E:\meta_variations_20s\a.mp4"), "e")
+        self.assertEqual(windows_drive_letter("/mnt/f/video/a.mp4"), "f")
+        self.assertIsNone(windows_drive_letter(r"\\wsl$\Ubuntu\home\kenke\a.mp4"))
 
     def test_wsl_unc_path_to_wsl(self) -> None:
         self.assertEqual(
@@ -82,6 +87,12 @@ class WslBridgeTests(unittest.TestCase):
         self.assertEqual(runtime.detector_python("eva02"), "/repo/eva/bin/python")
         self.assertEqual(runtime.dinov3_trt_backbone_engine(), "/engines/dinov3.engine")
         self.assertEqual(runtime.eva02_compile_backbone(), "none")
+
+    def test_drvfs_mount_script(self) -> None:
+        bridge = WslBridge("Ubuntu", "/repo")
+        script = bridge.drvfs_mount_script("E")
+        self.assertIn("mount -t drvfs E: /mnt/e", script)
+        self.assertIn("mountpoint -q /mnt/e", script)
 
 
 class ProgressTests(unittest.TestCase):

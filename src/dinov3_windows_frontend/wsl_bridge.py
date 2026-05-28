@@ -6,8 +6,10 @@ import os
 import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
 
-from .path_utils import wsl_path_to_unc
+from .path_utils import windows_drive_letter, wsl_path_to_unc
 
 
 def hidden_subprocess_kwargs() -> dict:
@@ -86,6 +88,9 @@ class WslBridge:
 
     def base_args(self) -> list[str]:
         return ["wsl.exe", "-d", self.distro, "--cd", self.repo_path, "--"]
+
+    def root_args(self) -> list[str]:
+        return ["wsl.exe", "-d", self.distro, "-u", "root", "--"]
 
     def bash_args(self, script: str) -> list[str]:
         encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
@@ -184,6 +189,42 @@ rm -f "$tmp"
             "export CXX=${CXX:-$PWD/.runtime/mamba_py311/bin/x86_64-conda-linux-gnu-g++}; "
             "fi; "
         )
+
+    def drvfs_mount_script(self, drive: str) -> str:
+        normalized = drive.strip().lower()
+        if not normalized or len(normalized) != 1 or not normalized.isalpha():
+            raise ValueError(f"invalid drive letter: {drive!r}")
+        mountpoint = f"/mnt/{normalized}"
+        win_drive = f"{normalized.upper()}:"
+        return (
+            "set -euo pipefail; "
+            f"mkdir -p {shlex.quote(mountpoint)}; "
+            f"if mountpoint -q {shlex.quote(mountpoint)}; then "
+            f"echo {shlex.quote('mounted ' + win_drive + ' ' + mountpoint)}; "
+            "else "
+            f"mount -t drvfs {shlex.quote(win_drive)} {shlex.quote(mountpoint)}; "
+            f"echo {shlex.quote('mounted ' + win_drive + ' ' + mountpoint)}; "
+            "fi"
+        )
+
+    def ensure_drvfs_mounts(self, paths: Iterable[str | Path], *, timeout: int = 20) -> list[tuple[str, bool, str]]:
+        drives = sorted({drive for path in paths if (drive := windows_drive_letter(path))})
+        results: list[tuple[str, bool, str]] = []
+        for drive in drives:
+            script = self.drvfs_mount_script(drive)
+            completed = subprocess.run(
+                [*self.root_args(), "bash", "-lc", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+                **hidden_subprocess_kwargs(),
+            )
+            detail = (completed.stdout or completed.stderr or "").strip()
+            results.append((drive, completed.returncode == 0, detail))
+        return results
 
     def parse_env(self, text: str) -> dict[str, str]:
         values: dict[str, str] = {}

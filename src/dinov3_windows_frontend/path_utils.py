@@ -31,6 +31,17 @@ def windows_path_to_wsl(path: str | Path) -> str:
     return raw
 
 
+def windows_drive_letter(path: str | Path) -> str | None:
+    raw = str(path).strip().strip('"').replace("\\", "/")
+    match = re.match(r"^([A-Za-z]):(?:/|$)", raw)
+    if match:
+        return match.group(1).lower()
+    match = re.match(r"^/mnt/([A-Za-z])(?:/|$)", raw)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
 def wsl_path_to_unc(distro: str, path: str | Path) -> str:
     raw = str(path).replace("\\", "/")
     if raw.startswith("/mnt/") and len(raw) > 7 and raw[6] == "/":
